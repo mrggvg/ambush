@@ -21,6 +21,11 @@ import (
 	socks5 "github.com/things-go/go-socks5"
 )
 
+const (
+	pingInterval = 30 * time.Second
+	pongTimeout  = 10 * time.Second
+)
+
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
@@ -172,12 +177,34 @@ func main() {
 			return
 		}
 
-		session, err := yamux.Server(&wsConn{conn: conn}, nil)
+		conn.SetPongHandler(func(string) error {
+			return conn.SetReadDeadline(time.Now().Add(pingInterval + pongTimeout))
+		})
+		_ = conn.SetReadDeadline(time.Now().Add(pingInterval + pongTimeout))
+
+		wsc := &wsConn{conn: conn}
+		session, err := yamux.Server(wsc, nil)
 		if err != nil {
 			log.Printf("yamux failed: %v", err)
 			_ = conn.Close()
 			return
 		}
+
+		go func() {
+			ticker := time.NewTicker(pingInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					if err := wsc.ping(pongTimeout); err != nil {
+						_ = session.Close()
+						return
+					}
+				case <-session.CloseChan():
+					return
+				}
+			}
+		}()
 
 		log.Printf("exitnode connected from %s", r.RemoteAddr)
 		pool.add(session)
@@ -242,6 +269,12 @@ func (c *wsConn) Write(b []byte) (int, error) {
 		return 0, err
 	}
 	return len(b), nil
+}
+
+func (c *wsConn) ping(timeout time.Duration) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(timeout))
 }
 
 func (c *wsConn) Close() error                       { return c.conn.Close() }

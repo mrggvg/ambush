@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -9,24 +11,21 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/hashicorp/yamux"
-	"github.com/things-go/go-socks5"
-)
-
-const (
-	exitNodeToken = "hardcoded-secret-token"
-	socksUser     = "user"
-	socksPass     = "password"
+	"github.com/jackc/pgx/v5/pgxpool"
+	socks5 "github.com/things-go/go-socks5"
 )
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
+// Pool holds active exitnode yamux sessions.
 type Pool struct {
 	mu       sync.Mutex
 	sessions []*yamux.Session
@@ -82,11 +81,68 @@ func (p *Pool) Dial(_ context.Context, _, addr string) (net.Conn, error) {
 	return stream, nil
 }
 
+// dbCredentialStore validates SOCKS5 username/password against the database.
+type dbCredentialStore struct {
+	db *pgxpool.Pool
+}
+
+func (s *dbCredentialStore) Valid(user, password, _ string) bool {
+	var ok bool
+	err := s.db.QueryRow(context.Background(),
+		`SELECT EXISTS(
+			SELECT 1 FROM proxy_credentials
+			WHERE username = $1
+			  AND password_hash = crypt($2, password_hash)
+			  AND is_active = true
+		)`, user, password,
+	).Scan(&ok)
+	if err != nil {
+		log.Printf("socks5 auth db error: %v", err)
+		return false
+	}
+	return ok
+}
+
+func validateExitNodeToken(ctx context.Context, db *pgxpool.Pool, token string) bool {
+	hash := sha256Hex(token)
+	var ok bool
+	err := db.QueryRow(ctx,
+		`SELECT EXISTS(
+			SELECT 1 FROM exit_node_tokens
+			WHERE token_hash = $1
+			  AND is_active = true
+			  AND (expires_at IS NULL OR expires_at > now())
+		)`, hash,
+	).Scan(&ok)
+	if err != nil {
+		log.Printf("token auth db error: %v", err)
+		return false
+	}
+	return ok
+}
+
+func sha256Hex(s string) string {
+	h := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(h[:])
+}
+
 func main() {
+	db, err := pgxpool.New(context.Background(), os.Getenv("DATABASE_URL"))
+	if err != nil {
+		log.Fatalf("db connect failed: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.Ping(context.Background()); err != nil {
+		log.Fatalf("db ping failed: %v", err)
+	}
+	log.Println("connected to database")
+
 	pool := &Pool{}
 
 	http.HandleFunc("/exitnode", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("token") != exitNodeToken {
+		token := r.URL.Query().Get("token")
+		if !validateExitNodeToken(r.Context(), db, token) {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -116,15 +172,23 @@ func main() {
 
 	go func() {
 		proxy := socks5.NewServer(
-			socks5.WithCredential(socks5.StaticCredentials{socksUser: socksPass}),
+			socks5.WithCredential(&dbCredentialStore{db: db}),
 			socks5.WithDial(pool.Dial),
 		)
-		log.Println("SOCKS5 listening on :1080")
-		log.Fatal(proxy.ListenAndServe("tcp", ":1080"))
+		socks5Addr := os.Getenv("SOCKS5_ADDR")
+		if socks5Addr == "" {
+			socks5Addr = ":1080"
+		}
+		log.Printf("SOCKS5 listening on %s", socks5Addr)
+		log.Fatal(proxy.ListenAndServe("tcp", socks5Addr))
 	}()
 
-	log.Println("gateway listening on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	gatewayAddr := os.Getenv("GATEWAY_ADDR")
+	if gatewayAddr == "" {
+		gatewayAddr = ":8080"
+	}
+	log.Printf("gateway listening on %s", gatewayAddr)
+	log.Fatal(http.ListenAndServe(gatewayAddr, nil))
 }
 
 // wsConn wraps a gorilla WebSocket connection as a net.Conn for yamux.

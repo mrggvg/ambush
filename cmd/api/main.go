@@ -133,7 +133,7 @@ func (s *Server) createToken(w http.ResponseWriter, r *http.Request) {
 	userID := chi.URLParam(r, "userID")
 
 	var body struct {
-		Label     string `json:"label"`
+		Label     string  `json:"label"`
 		ExpiresAt *string `json:"expires_at"` // RFC3339 or null
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Label == "" {

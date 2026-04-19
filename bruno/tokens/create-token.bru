@@ -1,0 +1,22 @@
+meta {
+  name: Create Exit Node Token
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/users/{{userId}}/tokens
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{adminToken}}
+}
+
+body:json {
+  {
+    "label": "vps-fra-1",
+    "expires_at": null
+  }
+}

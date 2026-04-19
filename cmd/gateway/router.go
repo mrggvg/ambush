@@ -51,7 +51,24 @@ func (r *Router) Dial(ctx context.Context, _, addr string) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return r.openStream(se, addr)
+
+	conn, err := r.openStream(se, addr)
+	if err != nil {
+		// session died between selection and open — clear affinity and retry once
+		r.clearAffinity(host)
+		se, err = r.assignSession(host)
+		if err != nil {
+			return nil, err
+		}
+		return r.openStream(se, addr)
+	}
+	return conn, nil
+}
+
+func (r *Router) clearAffinity(host string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.affinity, host)
 }
 
 func (r *Router) assignSession(host string) (*sessionEntry, error) {

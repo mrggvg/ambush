@@ -4,6 +4,7 @@
 # compiled binaries (root-level only)
 /exitnode
 /gateway
+/api
 
 # env files
 .env

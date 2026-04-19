@@ -4,15 +4,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
-	"fmt"
-	"io"
 	"log"
-	"math/rand/v2"
 	"net"
 	"net/http"
 	"os"
-	"sync"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -30,63 +27,6 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
-// Pool holds active exitnode yamux sessions.
-type Pool struct {
-	mu       sync.Mutex
-	sessions []*yamux.Session
-}
-
-func (p *Pool) add(s *yamux.Session) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.sessions = append(p.sessions, s)
-	log.Printf("pool: exitnode added (%d total)", len(p.sessions))
-}
-
-func (p *Pool) remove(s *yamux.Session) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for i, sess := range p.sessions {
-		if sess == s {
-			p.sessions = append(p.sessions[:i], p.sessions[i+1:]...)
-			break
-		}
-	}
-	log.Printf("pool: exitnode removed (%d total)", len(p.sessions))
-}
-
-func (p *Pool) pick() *yamux.Session {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	alive := make([]*yamux.Session, 0, len(p.sessions))
-	for _, s := range p.sessions {
-		if !s.IsClosed() {
-			alive = append(alive, s)
-		}
-	}
-	if len(alive) == 0 {
-		return nil
-	}
-	return alive[rand.IntN(len(alive))]
-}
-
-func (p *Pool) Dial(_ context.Context, _, addr string) (net.Conn, error) {
-	session := p.pick()
-	if session == nil {
-		return nil, errors.New("no exitnodes available")
-	}
-	stream, err := session.Open()
-	if err != nil {
-		return nil, err
-	}
-	if _, err := fmt.Fprintf(stream, "%s\n", addr); err != nil {
-		_ = stream.Close()
-		return nil, err
-	}
-	return stream, nil
-}
-
-// dbCredentialStore validates SOCKS5 username/password against the database.
 type dbCredentialStore struct {
 	db *pgxpool.Pool
 }
@@ -108,7 +48,6 @@ func (s *dbCredentialStore) Valid(user, password, _ string) bool {
 	return ok
 }
 
-// validateExitNodeToken returns the token ID on success, empty string on failure.
 func validateExitNodeToken(ctx context.Context, db *pgxpool.Pool, token string) string {
 	hash := sha256Hex(token)
 	var id string
@@ -161,6 +100,7 @@ func main() {
 	log.Println("connected to database")
 
 	pool := &Pool{}
+	router := NewRouter(pool)
 
 	http.HandleFunc("/exitnode", func(w http.ResponseWriter, r *http.Request) {
 		tokenID := validateExitNodeToken(r.Context(), db, r.URL.Query().Get("token"))
@@ -206,80 +146,64 @@ func main() {
 			}
 		}()
 
+		entry := newSessionEntry(session)
 		log.Printf("exitnode connected from %s", r.RemoteAddr)
-		pool.add(session)
+		pool.add(entry)
 		defer func() {
-			pool.remove(session)
+			pool.remove(entry)
 			_ = session.Close()
 		}()
 
 		<-session.CloseChan()
 	})
 
+	socks5Addr := os.Getenv("SOCKS5_ADDR")
+	if socks5Addr == "" {
+		socks5Addr = ":1080"
+	}
+	socks5Ln, err := net.Listen("tcp", socks5Addr)
+	if err != nil {
+		log.Fatalf("socks5 listen failed: %v", err)
+	}
+
+	proxy := socks5.NewServer(
+		socks5.WithCredential(&dbCredentialStore{db: db}),
+		socks5.WithDial(router.Dial),
+	)
 	go func() {
-		proxy := socks5.NewServer(
-			socks5.WithCredential(&dbCredentialStore{db: db}),
-			socks5.WithDial(pool.Dial),
-		)
-		socks5Addr := os.Getenv("SOCKS5_ADDR")
-		if socks5Addr == "" {
-			socks5Addr = ":1080"
-		}
 		log.Printf("SOCKS5 listening on %s", socks5Addr)
-		log.Fatal(proxy.ListenAndServe("tcp", socks5Addr))
+		if err := proxy.Serve(socks5Ln); err != nil {
+			log.Printf("SOCKS5 stopped: %v", err)
+		}
 	}()
 
 	gatewayAddr := os.Getenv("GATEWAY_ADDR")
 	if gatewayAddr == "" {
 		gatewayAddr = ":8080"
 	}
-	log.Printf("gateway listening on %s", gatewayAddr)
-	log.Fatal(http.ListenAndServe(gatewayAddr, nil))
-}
+	httpServer := &http.Server{Addr: gatewayAddr}
 
-// wsConn wraps a gorilla WebSocket connection as a net.Conn for yamux.
-type wsConn struct {
-	conn   *websocket.Conn
-	mu     sync.Mutex
-	reader io.Reader
-}
-
-func (c *wsConn) Read(b []byte) (int, error) {
-	for {
-		if c.reader != nil {
-			n, err := c.reader.Read(b)
-			if err == io.EOF {
-				c.reader = nil
-				continue
-			}
-			return n, err
+	go func() {
+		log.Printf("gateway listening on %s", gatewayAddr)
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("gateway stopped: %v", err)
 		}
-		_, r, err := c.conn.NextReader()
-		if err != nil {
-			return 0, err
-		}
-		c.reader = r
-	}
-}
+	}()
 
-func (c *wsConn) Write(b []byte) (int, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if err := c.conn.WriteMessage(websocket.BinaryMessage, b); err != nil {
-		return 0, err
-	}
-	return len(b), nil
-}
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
+	<-quit
 
-func (c *wsConn) ping(timeout time.Duration) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(timeout))
-}
+	log.Println("shutting down — draining active streams...")
+	_ = socks5Ln.Close()
+	pool.waitStreams(30 * time.Second)
 
-func (c *wsConn) Close() error                       { return c.conn.Close() }
-func (c *wsConn) LocalAddr() net.Addr                { return c.conn.LocalAddr() }
-func (c *wsConn) RemoteAddr() net.Addr               { return c.conn.RemoteAddr() }
-func (c *wsConn) SetDeadline(t time.Time) error      { return c.conn.SetWriteDeadline(t) }
-func (c *wsConn) SetReadDeadline(t time.Time) error  { return c.conn.SetReadDeadline(t) }
-func (c *wsConn) SetWriteDeadline(t time.Time) error { return c.conn.SetWriteDeadline(t) }
+	log.Println("closing exitnode sessions...")
+	pool.closeAll()
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = httpServer.Shutdown(shutdownCtx)
+
+	log.Println("shutdown complete")
+}

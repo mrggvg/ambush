@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"log"
 	"net"
 	"net/http"
@@ -82,6 +83,11 @@ func trackExitNodeIP(ctx context.Context, db *pgxpool.Pool, tokenID, remoteAddr 
 	}
 }
 
+func jsonOK(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(v)
+}
+
 func sha256Hex(s string) string {
 	h := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(h[:])
@@ -101,6 +107,19 @@ func main() {
 
 	pool := &Pool{}
 	router := NewRouter(pool)
+
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		entries := pool.snapshot()
+		totalStreams := int32(0)
+		for _, e := range entries {
+			totalStreams += e.activeStreams.Load()
+		}
+		jsonOK(w, map[string]any{
+			"status":        "ok",
+			"exitnodes":     len(entries),
+			"active_streams": totalStreams,
+		})
+	})
 
 	http.HandleFunc("/exitnode", func(w http.ResponseWriter, r *http.Request) {
 		tokenID := validateExitNodeToken(r.Context(), db, r.URL.Query().Get("token"))
@@ -185,6 +204,7 @@ func main() {
 
 	go func() {
 		log.Printf("gateway listening on %s", gatewayAddr)
+		log.Printf("health endpoint: http://%s/health", gatewayAddr)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("gateway stopped: %v", err)
 		}

@@ -103,22 +103,39 @@ func (s *dbCredentialStore) Valid(user, password, _ string) bool {
 	return ok
 }
 
-func validateExitNodeToken(ctx context.Context, db *pgxpool.Pool, token string) bool {
+// validateExitNodeToken returns the token ID on success, empty string on failure.
+func validateExitNodeToken(ctx context.Context, db *pgxpool.Pool, token string) string {
 	hash := sha256Hex(token)
-	var ok bool
+	var id string
 	err := db.QueryRow(ctx,
-		`SELECT EXISTS(
-			SELECT 1 FROM exit_node_tokens
-			WHERE token_hash = $1
-			  AND is_active = true
-			  AND (expires_at IS NULL OR expires_at > now())
-		)`, hash,
-	).Scan(&ok)
+		`SELECT id FROM exit_node_tokens
+		 WHERE token_hash = $1
+		   AND is_active = true
+		   AND (expires_at IS NULL OR expires_at > now())`,
+		hash,
+	).Scan(&id)
 	if err != nil {
 		log.Printf("token auth db error: %v", err)
-		return false
+		return ""
 	}
-	return ok
+	return id
+}
+
+func trackExitNodeIP(ctx context.Context, db *pgxpool.Pool, tokenID, remoteAddr string) {
+	ip, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		log.Printf("ip tracking: failed to parse addr %s: %v", remoteAddr, err)
+		return
+	}
+	_, err = db.Exec(ctx,
+		`INSERT INTO exit_node_ips (token_id, ip)
+		 VALUES ($1, $2)
+		 ON CONFLICT (token_id, ip) DO UPDATE SET last_seen_at = now()`,
+		tokenID, ip,
+	)
+	if err != nil {
+		log.Printf("ip tracking: upsert failed: %v", err)
+	}
 }
 
 func sha256Hex(s string) string {
@@ -141,11 +158,13 @@ func main() {
 	pool := &Pool{}
 
 	http.HandleFunc("/exitnode", func(w http.ResponseWriter, r *http.Request) {
-		token := r.URL.Query().Get("token")
-		if !validateExitNodeToken(r.Context(), db, token) {
+		tokenID := validateExitNodeToken(r.Context(), db, r.URL.Query().Get("token"))
+		if tokenID == "" {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
+
+		trackExitNodeIP(r.Context(), db, tokenID, r.RemoteAddr)
 
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {

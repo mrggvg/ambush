@@ -16,9 +16,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/charmbracelet/huh"
 	"github.com/gorilla/websocket"
 	"github.com/hashicorp/yamux"
-	"golang.org/x/term"
 )
 
 type Config struct {
@@ -59,29 +59,33 @@ func saveConfig(cfg *Config) error {
 }
 
 func runSetup() (*Config, error) {
-	reader := bufio.NewReader(os.Stdin)
+	cfg := &Config{GatewayURL: "ws://localhost:8080"}
 
-	fmt.Println("=== Ambush Exit Node Setup ===")
-
-	fmt.Print("Gateway URL [ws://localhost:8080]: ")
-	gatewayURL, _ := reader.ReadString('\n')
-	gatewayURL = strings.TrimSpace(gatewayURL)
-	if gatewayURL == "" {
-		gatewayURL = "ws://localhost:8080"
-	}
-
-	fmt.Print("Token: ")
-	tokenBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
-	fmt.Println()
+	err := huh.NewForm(
+		huh.NewGroup(
+			huh.NewInput().
+				Title("Gateway URL").
+				Placeholder("ws://localhost:8080").
+				Value(&cfg.GatewayURL),
+			huh.NewInput().
+				Title("Token").
+				Placeholder("paste your exit node token").
+				EchoMode(huh.EchoModePassword).
+				Validate(func(s string) error {
+					if strings.TrimSpace(s) == "" {
+						return errors.New("token cannot be empty")
+					}
+					return nil
+				}).
+				Value(&cfg.Token),
+		),
+	).WithTheme(huh.ThemeCatppuccin()).Run()
 	if err != nil {
-		return nil, fmt.Errorf("failed to read token: %w", err)
-	}
-	token := strings.TrimSpace(string(tokenBytes))
-	if token == "" {
-		return nil, errors.New("token cannot be empty")
+		return nil, err
 	}
 
-	cfg := &Config{GatewayURL: gatewayURL, Token: token}
+	cfg.Token = strings.TrimSpace(cfg.Token)
+
 	if err := saveConfig(cfg); err != nil {
 		return nil, fmt.Errorf("failed to save config: %w", err)
 	}

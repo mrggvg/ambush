@@ -2,32 +2,106 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/hashicorp/yamux"
+	"golang.org/x/term"
 )
 
-func main() {
-	gatewayURL := os.Getenv("GATEWAY_URL")
+type Config struct {
+	GatewayURL string `json:"gateway_url"`
+	Token      string `json:"token"`
+}
+
+func configPath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".ambush", "exitnode.json")
+}
+
+func loadConfig() (*Config, error) {
+	data, err := os.ReadFile(configPath())
+	if err != nil {
+		return nil, err
+	}
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, err
+	}
+	if cfg.Token == "" {
+		return nil, errors.New("config missing token")
+	}
+	return &cfg, nil
+}
+
+func saveConfig(cfg *Config) error {
+	path := configPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0600)
+}
+
+func runSetup() (*Config, error) {
+	reader := bufio.NewReader(os.Stdin)
+
+	fmt.Println("=== Ambush Exit Node Setup ===")
+
+	fmt.Print("Gateway URL [ws://localhost:8080]: ")
+	gatewayURL, _ := reader.ReadString('\n')
+	gatewayURL = strings.TrimSpace(gatewayURL)
 	if gatewayURL == "" {
 		gatewayURL = "ws://localhost:8080"
 	}
-	token := os.Getenv("EXIT_NODE_TOKEN")
+
+	fmt.Print("Token: ")
+	tokenBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
+	fmt.Println()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read token: %w", err)
+	}
+	token := strings.TrimSpace(string(tokenBytes))
 	if token == "" {
-		log.Fatal("EXIT_NODE_TOKEN is required")
+		return nil, errors.New("token cannot be empty")
 	}
 
+	cfg := &Config{GatewayURL: gatewayURL, Token: token}
+	if err := saveConfig(cfg); err != nil {
+		return nil, fmt.Errorf("failed to save config: %w", err)
+	}
+
+	fmt.Println("Config saved to", configPath())
+	return cfg, nil
+}
+
+func main() {
+	cfg, err := loadConfig()
+	if err != nil {
+		cfg, err = runSetup()
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+
+	log.Printf("connecting to %s", cfg.GatewayURL)
 	for {
-		if err := connect(gatewayURL, token); err != nil {
+		if err := connect(cfg.GatewayURL, cfg.Token); err != nil {
 			log.Printf("connection lost: %v — retrying in 5s", err)
 		}
 		time.Sleep(5 * time.Second)

@@ -15,5 +15,7 @@ require (
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/things-go/go-socks5 v0.1.1 // indirect
 	golang.org/x/sync v0.17.0 // indirect
+	golang.org/x/sys v0.43.0 // indirect
+	golang.org/x/term v0.42.0 // indirect
 	golang.org/x/text v0.29.0 // indirect
 )

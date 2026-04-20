@@ -245,7 +245,7 @@ func main() {
 		socks5.WithDialAndRequest(func(ctx context.Context, network, addr string, req *socks5.Request) (net.Conn, error) {
 			username := ""
 			if req.AuthContext != nil {
-				username = req.AuthContext.Payload["Username"]
+				username = req.AuthContext.Payload["username"]
 			}
 			ctx = withRequestID(ctx, newRequestID())
 			return router.DialWithUser(ctx, network, addr, username)

@@ -52,6 +52,11 @@ func (c *wsConn) ping(timeout time.Duration) error {
 func (c *wsConn) Close() error                       { return c.conn.Close() }
 func (c *wsConn) LocalAddr() net.Addr                { return c.conn.LocalAddr() }
 func (c *wsConn) RemoteAddr() net.Addr               { return c.conn.RemoteAddr() }
-func (c *wsConn) SetDeadline(t time.Time) error      { return c.conn.SetWriteDeadline(t) }
+func (c *wsConn) SetDeadline(t time.Time) error {
+	if err := c.conn.SetReadDeadline(t); err != nil {
+		return err
+	}
+	return c.conn.SetWriteDeadline(t)
+}
 func (c *wsConn) SetReadDeadline(t time.Time) error  { return c.conn.SetReadDeadline(t) }
 func (c *wsConn) SetWriteDeadline(t time.Time) error { return c.conn.SetWriteDeadline(t) }

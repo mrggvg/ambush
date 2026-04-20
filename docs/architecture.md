@@ -104,6 +104,7 @@ yamux requires a `net.Conn`. gorilla WebSocket is not one — it frames messages
 - **Read**: calls `conn.NextReader()` per message, drains each frame, loops to next on EOF
 - **Write**: wraps each write as a single binary WebSocket message, protected by a mutex
 - **ping**: uses `WriteControl` through the same mutex to avoid concurrent write panics
+- **SetDeadline**: sets both read and write deadlines — yamux calls this to enforce its own keepalive and stream timeouts, so both must be applied or stalled connections leak goroutines
 
 ## Metrics
 

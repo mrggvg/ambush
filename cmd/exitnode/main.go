@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -135,11 +136,27 @@ func main() {
 	}
 
 	log.Printf("connecting to %s", cfg.GatewayURL)
+	const (
+		backoffMin = 1 * time.Second
+		backoffMax = 60 * time.Second
+	)
+	delay := backoffMin
 	for {
-		if err := connect(cfg); err != nil {
-			log.Printf("connection lost: %v — retrying in 5s", err)
+		err := connect(cfg)
+		if err == nil {
+			// clean disconnect — reset backoff and reconnect quickly
+			delay = backoffMin
+			continue
 		}
-		time.Sleep(5 * time.Second)
+		jitter := time.Duration(rand.Int63n(int64(delay / 2)))
+		log.Printf("connection lost: %v — retrying in %s", err, (delay + jitter).Round(time.Millisecond))
+		time.Sleep(delay + jitter)
+		if delay < backoffMax {
+			delay *= 2
+			if delay > backoffMax {
+				delay = backoffMax
+			}
+		}
 	}
 }
 
@@ -300,6 +317,11 @@ func (c *wsConn) Write(b []byte) (int, error) {
 func (c *wsConn) Close() error                       { return c.conn.Close() }
 func (c *wsConn) LocalAddr() net.Addr                { return c.conn.LocalAddr() }
 func (c *wsConn) RemoteAddr() net.Addr               { return c.conn.RemoteAddr() }
-func (c *wsConn) SetDeadline(t time.Time) error      { return c.conn.SetWriteDeadline(t) }
+func (c *wsConn) SetDeadline(t time.Time) error {
+	if err := c.conn.SetReadDeadline(t); err != nil {
+		return err
+	}
+	return c.conn.SetWriteDeadline(t)
+}
 func (c *wsConn) SetReadDeadline(t time.Time) error  { return c.conn.SetReadDeadline(t) }
 func (c *wsConn) SetWriteDeadline(t time.Time) error { return c.conn.SetWriteDeadline(t) }

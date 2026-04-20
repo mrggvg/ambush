@@ -44,6 +44,9 @@
 - [x] `user_exit_node_diversity` view
 - [x] Hosted on Supabase
 
+### Gateway
+- [x] `wsConn.SetDeadline` sets both read and write deadlines — previously only write was set, causing goroutine leaks on stalled connections
+
 ### Observability
 - [x] Structured logging with `slog` (JSON output, consistent field names) in gateway
 

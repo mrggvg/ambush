@@ -6,7 +6,9 @@ The gateway's router (`cmd/gateway/router.go`) is responsible for deciding which
 
 ```mermaid
 flowchart TD
-    A[New SOCKS5 CONNECT\nexample.com:443] --> B{Affinity entry\nfor example.com?}
+    A[New SOCKS5 CONNECT\nexample.com:443] --> RL{Under per-credential\nstream limit?}
+    RL -->|No — limit reached| RLE[Error: rate limit exceeded]
+    RL -->|Yes| B{Affinity entry\nfor example.com?}
 
     B -->|Yes| C{Is entry valid?}
     C --> C1{Session alive?}
@@ -49,6 +51,24 @@ Each `(domain → exit node)` assignment has two limits. Whichever is hit first 
 | `maxStreamsPerNode` | 10 | Max concurrent streams per exit node |
 
 The jitter (±20%) prevents all domains from rotating at the same time, which would cause a sudden IP change wave.
+
+## Cooldown and public IP grouping
+
+Cooldown is keyed by `publicIP:domain`, not by session ID. If two exit nodes share the same public IP address (for example, two devices behind the same home NAT router), they are treated as a single unit for cooldown purposes: rotating away from one blocks both for that domain. Rotating between two sessions on the same IP would provide no benefit to the target site.
+
+The gateway logs a warning when multiple exit nodes connect from the same public IP.
+
+## Per-credential rate limiting
+
+Each SOCKS5 credential (username) has a cap on the total number of concurrent open streams, regardless of which exit nodes those streams are on. This prevents a single credential from monopolising the entire pool.
+
+| Parameter | Default | Env var |
+|-----------|---------|---------|
+| `maxStreamsPerCredential` | 20 | `MAX_STREAMS_PER_CREDENTIAL` |
+
+When the limit is reached, new connection attempts from that credential are rejected immediately with an error. Existing streams are unaffected. The slot is released automatically when the stream closes.
+
+The limit applies per credential, not per exit node. A user with 20 streams open on 4 different exit nodes (5 each) is at their limit even though no individual node is saturated.
 
 ## Why this looks natural
 

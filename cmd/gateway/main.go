@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -117,7 +118,15 @@ func main() {
 	slog.Info("connected to database")
 
 	pool := &Pool{}
-	router := NewRouter(pool)
+
+	maxStreams := int32(20)
+	if v := os.Getenv("MAX_STREAMS_PER_CREDENTIAL"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 32); err == nil && n > 0 {
+			maxStreams = int32(n)
+		}
+	}
+	slog.Info("credential rate limit configured", "max_streams_per_credential", maxStreams)
+	router := NewRouter(pool, NewCredentialLimiter(maxStreams))
 
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		entries := pool.snapshot()
@@ -176,11 +185,16 @@ func main() {
 			}
 		}()
 
-		entry := newSessionEntry(session)
-		slog.Info("exitnode connected", "exitnode_id", entry.id, "remote_addr", r.RemoteAddr, "token_id", tokenID)
+		exitIP, _, _ := net.SplitHostPort(r.RemoteAddr)
+		entry := newSessionEntry(session, exitIP)
+		slog.Info("exitnode connected", "exitnode_id", entry.id, "ip", exitIP, "token_id", tokenID)
 		pool.add(entry)
+		if peers := pool.byIP(exitIP); len(peers) > 1 {
+			slog.Warn("multiple exit nodes share the same public IP — they will share cooldown slots per domain",
+				"ip", exitIP, "count", len(peers))
+		}
 		defer func() {
-			slog.Info("exitnode disconnected", "exitnode_id", entry.id, "remote_addr", r.RemoteAddr)
+			slog.Info("exitnode disconnected", "exitnode_id", entry.id, "ip", exitIP)
 			pool.remove(entry)
 			_ = session.Close()
 		}()
@@ -224,18 +238,17 @@ func main() {
 	go func() {
 		certFile := os.Getenv("TLS_CERT")
 		keyFile := os.Getenv("TLS_KEY")
-		if certFile != "" && keyFile != "" {
-			slog.Info("gateway listening", "addr", gatewayAddr, "tls", true)
-			if err := httpServer.ListenAndServeTLS(certFile, keyFile); err != nil && err != http.ErrServerClosed {
-				slog.Error("gateway stopped", "error", err)
-				os.Exit(1)
-			}
+		tls := certFile != "" && keyFile != ""
+		slog.Info("gateway listening", "addr", gatewayAddr, "tls", tls)
+		var err error
+		if tls {
+			err = httpServer.ListenAndServeTLS(certFile, keyFile)
 		} else {
-			slog.Info("gateway listening", "addr", gatewayAddr, "tls", false)
-			if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				slog.Error("gateway stopped", "error", err)
-				os.Exit(1)
-			}
+			err = httpServer.ListenAndServe()
+		}
+		if err != nil && err != http.ErrServerClosed {
+			slog.Error("gateway stopped", "error", err)
+			os.Exit(1)
 		}
 	}()
 

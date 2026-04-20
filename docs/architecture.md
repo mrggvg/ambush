@@ -59,14 +59,16 @@ graph TD
     WS["WebSocket Handler\n/exitnode"]
     SOCKS["SOCKS5 Server\n:1080"]
     HEALTH["Health Handler\n/health"]
-    POOL["Pool\nsessionEntry[]"]
-    ROUTER["Router\naffinity map\ncooldown map"]
+    POOL["Pool\nsessionEntry[] + public IP"]
+    ROUTER["Router\naffinity map\ncooldown map (IP:domain)"]
+    LIMITER["CredentialLimiter\nper-username stream cap"]
     DB["DB Pool\npgxpool"]
     YAMUX["yamux sessions"]
 
     WS -->|add/remove| POOL
     WS -->|auth| DB
-    SOCKS -->|"DialWithRequest\n(addr + username)"| ROUTER
+    SOCKS -->|"DialWithRequest\n(addr + username)"| LIMITER
+    LIMITER -->|acquire/release slot| ROUTER
     ROUTER -->|snapshot| POOL
     ROUTER -->|open stream| YAMUX
     HEALTH -->|snapshot| POOL

@@ -14,13 +14,15 @@ var sessionIDCounter atomic.Uint64
 
 type sessionEntry struct {
 	id           uint64
+	ip           string // public IP of the exit node as seen by the gateway
 	session      *yamux.Session
 	activeStreams atomic.Int32
 }
 
-func newSessionEntry(s *yamux.Session) *sessionEntry {
+func newSessionEntry(s *yamux.Session, ip string) *sessionEntry {
 	return &sessionEntry{
 		id:      sessionIDCounter.Add(1),
+		ip:      ip,
 		session: s,
 	}
 }
@@ -66,6 +68,19 @@ func (p *Pool) waitStreams(timeout time.Duration) {
 	case <-time.After(timeout):
 		slog.Warn("shutdown: timed out waiting for active streams")
 	}
+}
+
+// byIP returns all current entries (open or closed) sharing the given public IP.
+func (p *Pool) byIP(ip string) []*sessionEntry {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var out []*sessionEntry
+	for _, e := range p.entries {
+		if e.ip == ip {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 // snapshot returns alive entries without holding p.mu across the call.

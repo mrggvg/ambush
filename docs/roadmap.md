@@ -26,10 +26,11 @@
 - [x] Domain affinity — same domain routes through same exit node within a window
 - [x] Time-based rotation with jitter (5min base ± 20%)
 - [x] Request budget per assignment (100 requests max before rotation)
-- [x] Cooldown after rotation — rotated exit node excluded from domain for 10min
+- [x] Cooldown after rotation — rotated exit node excluded from domain for 10min; keyed by public IP so exit nodes sharing the same NAT address are treated as one unit
 - [x] Concurrency limit per exit node (max 10 concurrent streams)
 - [x] Stream idle timeout — 2min idle closes hung connections
 - [x] Per-user affinity — different SOCKS5 users hitting the same domain use different exit nodes (`WithDialAndRequest` + `username:host` affinity key)
+- [x] Per-credential rate limiting — cap on concurrent open streams per SOCKS5 username (`MAX_STREAMS_PER_CREDENTIAL`, default 20)
 
 ### API
 - [x] User management (create, list)
@@ -43,35 +44,40 @@
 - [x] `user_exit_node_diversity` view
 - [x] Hosted on Supabase
 
+### Observability
+- [x] Structured logging with `slog` (JSON output, consistent field names) in gateway
+
+### Deployment
+- [x] Dockerfile for gateway and API
+- [x] Dockerfile for exit node
+
+### Testing
+- [x] Unit tests for router — affinity, rotation, cooldown, concurrency limit, IP-based grouping
+- [x] Unit tests for pool and rate limiter
+
 ---
 
 ## TODO
 
 ### Security & correctness
-- [ ] Rate limiting per SOCKS5 credential
 - [ ] Per-user exit node diversity guarantee
 - [x] TLS on the exit node ↔ gateway tunnel — self-signed CA, no domain required (see [docs/tls.md](tls.md))
 - [ ] Rate limit on failed token auth attempts (prevent brute force on `/exitnode`)
 
 ### Observability
-- [ ] Structured logging with `slog` (JSON output) in gateway and API
 - [ ] Request IDs on exit node WebSocket connections
 - [ ] Prometheus metrics endpoint on gateway (active exit nodes, requests/s, stream errors, rotation events)
 
 ### Routing improvements
 - [ ] Exit node health scoring — track failure rates per exit node per domain, deprioritize flagged ones
 - [ ] Geo-awareness — record exit node country, allow SOCKS5 clients to request a specific region via credentials
-- [ ] Per-user routing key once username-in-dial is resolved
 
 ### Deployment
-- [ ] Dockerfile for gateway and API
-- [ ] Dockerfile / install script for exit node
 - [ ] systemd unit file for exit node (run as a persistent background service)
 - [ ] High availability — multiple gateway instances, exit nodes register with all of them
 
 ### Testing
 - [ ] End-to-end test — exit node connects, SOCKS5 client makes request, traffic flows through
-- [ ] Unit tests for router (affinity, rotation, cooldown, concurrency limit)
 - [ ] Load test — measure throughput and latency under concurrent connections
 
 ---
@@ -89,7 +95,6 @@ Ambush does not dictate how credentials are issued, how users are onboarded, or 
 ## Priority order (suggested)
 
 1. **End-to-end test** — verify the system actually works before building more on top of it
-2. **Username-in-dial-context** — unblocks rate limiting and diversity
-3. **TLS** — needed before any real deployment
-4. **Structured logging** — needed to debug production issues
-5. **Deployment** — Dockerfile + systemd so exit nodes can run as persistent services
+2. **systemd unit file** — so exit nodes can run as persistent background services without Docker
+3. **Prometheus metrics** — active exit nodes, requests/s, rotation events; needed once deployed at scale
+4. **Per-user diversity guarantee** — today multiple users can land on the same exit node; fix requires tracking assignments across users in `pickSession`

@@ -26,17 +26,19 @@ type affinityEntry struct {
 }
 
 // Router handles smart routing: domain affinity, rotation with cooldown,
-// and per-exitnode concurrency limits.
+// per-exitnode concurrency limits, and per-credential rate limiting.
 type Router struct {
 	mu       sync.Mutex
 	pool     *Pool
+	limiter  *CredentialLimiter
 	affinity map[string]*affinityEntry // domain -> active assignment
 	cooldown map[string]time.Time      // "sessionID:domain" -> expires
 }
 
-func NewRouter(pool *Pool) *Router {
+func NewRouter(pool *Pool, limiter *CredentialLimiter) *Router {
 	r := &Router{
 		pool:     pool,
+		limiter:  limiter,
 		affinity: make(map[string]*affinityEntry),
 		cooldown: make(map[string]time.Time),
 	}
@@ -62,6 +64,21 @@ func (r *Router) cleanupLoop() {
 // DialWithUser is the core dial function. username scopes affinity so two
 // different SOCKS5 users hitting the same domain use different exit nodes.
 func (r *Router) DialWithUser(ctx context.Context, _, addr, username string) (net.Conn, error) {
+	release, err := r.limiter.Acquire(username)
+	if err != nil {
+		slog.Warn("credential rate limit exceeded", "username", username, "active_streams", r.limiter.ActiveStreams(username))
+		return nil, err
+	}
+
+	conn, err := r.dial(ctx, addr, username)
+	if err != nil {
+		release()
+		return nil, err
+	}
+	return &rateLimitedConn{Conn: conn, release: release}, nil
+}
+
+func (r *Router) dial(ctx context.Context, addr, username string) (net.Conn, error) {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		host = addr
@@ -110,6 +127,7 @@ func (r *Router) assignSession(affinityKey, domain string) (*sessionEntry, error
 
 	se := r.pickSession(domain)
 	if se == nil {
+		slog.Warn("no eligible exit nodes", "domain", domain, "pool_size", len(r.pool.snapshot()))
 		return nil, errors.New("no exitnodes available")
 	}
 
@@ -130,6 +148,9 @@ func (r *Router) isAffinityValid(aff *affinityEntry) bool {
 
 // pickSession selects an eligible session for the given domain,
 // excluding sessions in cooldown or at their concurrency limit.
+// Cooldown is keyed by public IP so sessions sharing the same NAT address
+// are treated as one unit — rotating between them would not change the IP
+// the target site sees.
 func (r *Router) pickSession(domain string) *sessionEntry {
 	candidates := r.pool.snapshot()
 	eligible := make([]*sessionEntry, 0, len(candidates))
@@ -137,8 +158,7 @@ func (r *Router) pickSession(domain string) *sessionEntry {
 		if se.activeStreams.Load() >= maxStreamsPerNode {
 			continue
 		}
-		key := fmt.Sprintf("%d:%s", se.id, domain)
-		if exp, ok := r.cooldown[key]; ok && time.Now().Before(exp) {
+		if exp, ok := r.cooldown[se.ip+":"+domain]; ok && time.Now().Before(exp) {
 			continue
 		}
 		eligible = append(eligible, se)
@@ -165,8 +185,7 @@ func (r *Router) openStream(se *sessionEntry, addr, username string) (net.Conn, 
 }
 
 func (r *Router) setCooldown(se *sessionEntry, domain string) {
-	key := fmt.Sprintf("%d:%s", se.id, domain)
-	r.cooldown[key] = time.Now().Add(cooldownDuration)
+	r.cooldown[se.ip+":"+domain] = time.Now().Add(cooldownDuration)
 }
 
 func (r *Router) randomExpiry() time.Time {

@@ -45,7 +45,7 @@ func poolWithSessions(t *testing.T, n int) (*Pool, []*yamux.Session) {
 	for i := range n {
 		client, server := yamuxPair(t)
 		servers[i] = server
-		p.add(newSessionEntry(client))
+		p.add(newSessionEntry(client, fmt.Sprintf("10.0.0.%d", i+1)))
 	}
 	return p, servers
 }
@@ -72,10 +72,17 @@ func serveStreams(server *yamux.Session) {
 	}()
 }
 
+// connEntryID unwraps the chain rateLimitedConn → trackedConn to get the exit-node ID.
+func connEntryID(conn net.Conn) uint64 {
+	return conn.(*rateLimitedConn).Conn.(*trackedConn).entry.id
+}
+
 // newTestRouter constructs a Router without starting the background cleanup goroutine.
+// Uses a permissive limiter (1000 streams/credential) so router logic tests are unaffected.
 func newTestRouter(p *Pool) *Router {
 	return &Router{
 		pool:     p,
+		limiter:  NewCredentialLimiter(1000),
 		affinity: make(map[string]*affinityEntry),
 		cooldown: make(map[string]time.Time),
 	}
@@ -85,7 +92,7 @@ func newTestRouter(p *Pool) *Router {
 
 func TestIsAffinityValid_Valid(t *testing.T) {
 	client, _ := yamuxPair(t)
-	se := newSessionEntry(client)
+	se := newSessionEntry(client, "10.0.0.1")
 	r := newTestRouter(&Pool{})
 	aff := &affinityEntry{entry: se, requests: 0, expiresAt: time.Now().Add(time.Minute)}
 	if !r.isAffinityValid(aff) {
@@ -95,7 +102,7 @@ func TestIsAffinityValid_Valid(t *testing.T) {
 
 func TestIsAffinityValid_ClosedSession(t *testing.T) {
 	client, _ := yamuxPair(t)
-	se := newSessionEntry(client)
+	se := newSessionEntry(client, "10.0.0.1")
 	client.Close()
 	r := newTestRouter(&Pool{})
 	aff := &affinityEntry{entry: se, requests: 0, expiresAt: time.Now().Add(time.Minute)}
@@ -106,7 +113,7 @@ func TestIsAffinityValid_ClosedSession(t *testing.T) {
 
 func TestIsAffinityValid_Expired(t *testing.T) {
 	client, _ := yamuxPair(t)
-	se := newSessionEntry(client)
+	se := newSessionEntry(client, "10.0.0.1")
 	r := newTestRouter(&Pool{})
 	aff := &affinityEntry{entry: se, requests: 0, expiresAt: time.Now().Add(-time.Second)}
 	if r.isAffinityValid(aff) {
@@ -116,7 +123,7 @@ func TestIsAffinityValid_Expired(t *testing.T) {
 
 func TestIsAffinityValid_RequestBudgetExhausted(t *testing.T) {
 	client, _ := yamuxPair(t)
-	se := newSessionEntry(client)
+	se := newSessionEntry(client, "10.0.0.1")
 	r := newTestRouter(&Pool{})
 	aff := &affinityEntry{entry: se, requests: maxRequestsPerNode, expiresAt: time.Now().Add(time.Minute)}
 	if r.isAffinityValid(aff) {
@@ -126,7 +133,7 @@ func TestIsAffinityValid_RequestBudgetExhausted(t *testing.T) {
 
 func TestIsAffinityValid_StreamLimitReached(t *testing.T) {
 	client, _ := yamuxPair(t)
-	se := newSessionEntry(client)
+	se := newSessionEntry(client, "10.0.0.1")
 	se.activeStreams.Store(maxStreamsPerNode)
 	r := newTestRouter(&Pool{})
 	aff := &affinityEntry{entry: se, requests: 0, expiresAt: time.Now().Add(time.Minute)}
@@ -170,6 +177,27 @@ func TestPickSession_CooldownScopedToDomain(t *testing.T) {
 	r.setCooldown(se, "blocked.com")
 	if r.pickSession("other.com") == nil {
 		t.Fatal("cooldown for one domain must not block a different domain on the same node")
+	}
+}
+
+func TestPickSession_CooldownCoversAllSessionsOnSameIP(t *testing.T) {
+	// Two sessions with identical public IPs (e.g. two devices behind home NAT).
+	// Cooling down one must block the other — rotating between them would not
+	// change the IP the target site sees.
+	p := &Pool{}
+	client1, _ := yamuxPair(t)
+	client2, _ := yamuxPair(t)
+	se1 := newSessionEntry(client1, "1.2.3.4")
+	se2 := newSessionEntry(client2, "1.2.3.4") // same public IP
+	p.add(se1)
+	p.add(se2)
+
+	r := newTestRouter(p)
+	r.setCooldown(se1, "example.com") // cooldown key: "1.2.3.4:example.com"
+
+	// se2 shares the same IP → same cooldown key → must also be excluded
+	if r.pickSession("example.com") != nil {
+		t.Fatal("expected nil: both sessions share the cooled-down public IP")
 	}
 }
 
@@ -277,8 +305,7 @@ func TestAssignSession_SetsCooldownOnRotation(t *testing.T) {
 	r.assignSession("alice:example.com", "example.com")
 
 	r.mu.Lock()
-	key := fmt.Sprintf("%d:%s", se1.id, "example.com")
-	exp, ok := r.cooldown[key]
+	exp, ok := r.cooldown[se1.ip+":example.com"]
 	r.mu.Unlock()
 
 	if !ok {
@@ -306,8 +333,7 @@ func TestSetCooldown_BlocksSessionForDuration(t *testing.T) {
 	r.setCooldown(se, "example.com")
 
 	r.mu.Lock()
-	key := fmt.Sprintf("%d:%s", se.id, "example.com")
-	exp, ok := r.cooldown[key]
+	exp, ok := r.cooldown[se.ip+":example.com"]
 	r.mu.Unlock()
 
 	if !ok {
@@ -395,8 +421,8 @@ func TestDialWithUser_AffinityStickiness(t *testing.T) {
 	}
 	defer conn2.Close()
 
-	id1 := conn1.(*trackedConn).entry.id
-	id2 := conn2.(*trackedConn).entry.id
+	id1 := connEntryID(conn1)
+	id2 := connEntryID(conn2)
 	if id1 != id2 {
 		t.Fatalf("expected affinity: same exit node for both conns, got %d and %d", id1, id2)
 	}
@@ -505,7 +531,7 @@ func TestDialWithUser_RetriesOnDeadSession(t *testing.T) {
 	}
 	defer conn.Close()
 
-	if conn.(*trackedConn).entry.id == deadID {
+	if connEntryID(conn) == deadID {
 		t.Fatal("expected retry to use a different (alive) session")
 	}
 }

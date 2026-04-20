@@ -94,12 +94,25 @@ func runSetup() (*Config, error) {
 	return cfg, nil
 }
 
+func configFromEnv() *Config {
+	gwURL := os.Getenv("AMBUSH_GATEWAY_URL")
+	token := os.Getenv("AMBUSH_TOKEN")
+	if gwURL == "" || token == "" {
+		return nil
+	}
+	return &Config{GatewayURL: gwURL, Token: token}
+}
+
 func main() {
-	cfg, err := loadConfig()
-	if err != nil {
-		cfg, err = runSetup()
+	cfg := configFromEnv()
+	if cfg == nil {
+		var err error
+		cfg, err = loadConfig()
 		if err != nil {
-			log.Fatal(err)
+			cfg, err = runSetup()
+			if err != nil {
+				log.Fatal(err)
+			}
 		}
 	}
 

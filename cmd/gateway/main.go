@@ -187,7 +187,13 @@ func main() {
 
 	proxy := socks5.NewServer(
 		socks5.WithCredential(&dbCredentialStore{db: db}),
-		socks5.WithDial(router.Dial),
+		socks5.WithDialAndRequest(func(ctx context.Context, network, addr string, req *socks5.Request) (net.Conn, error) {
+			username := ""
+			if req.AuthContext != nil {
+				username = req.AuthContext.Payload["Username"]
+			}
+			return router.DialWithUser(ctx, network, addr, username)
+		}),
 	)
 	go func() {
 		log.Printf("SOCKS5 listening on %s", socks5Addr)

@@ -41,13 +41,17 @@ func NewRouter(pool *Pool) *Router {
 	}
 }
 
-func (r *Router) Dial(ctx context.Context, _, addr string) (net.Conn, error) {
+// DialWithUser is the core dial function. username scopes affinity so two
+// different SOCKS5 users hitting the same domain use different exit nodes.
+func (r *Router) DialWithUser(ctx context.Context, _, addr, username string) (net.Conn, error) {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		host = addr
 	}
 
-	se, err := r.assignSession(host)
+	affinityKey := username + ":" + host
+
+	se, err := r.assignSession(affinityKey, host)
 	if err != nil {
 		return nil, err
 	}
@@ -55,8 +59,8 @@ func (r *Router) Dial(ctx context.Context, _, addr string) (net.Conn, error) {
 	conn, err := r.openStream(se, addr)
 	if err != nil {
 		// session died between selection and open — clear affinity and retry once
-		r.clearAffinity(host)
-		se, err = r.assignSession(host)
+		r.clearAffinity(affinityKey)
+		se, err = r.assignSession(affinityKey, host)
 		if err != nil {
 			return nil, err
 		}
@@ -65,32 +69,32 @@ func (r *Router) Dial(ctx context.Context, _, addr string) (net.Conn, error) {
 	return conn, nil
 }
 
-func (r *Router) clearAffinity(host string) {
+func (r *Router) clearAffinity(key string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	delete(r.affinity, host)
+	delete(r.affinity, key)
 }
 
-func (r *Router) assignSession(host string) (*sessionEntry, error) {
+func (r *Router) assignSession(affinityKey, domain string) (*sessionEntry, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if aff := r.affinity[host]; aff != nil {
+	if aff := r.affinity[affinityKey]; aff != nil {
 		if r.isAffinityValid(aff) {
 			aff.requests++
 			return aff.entry, nil
 		}
 		// budget exhausted or session died — rotate
-		r.setCooldown(aff.entry, host)
-		delete(r.affinity, host)
+		r.setCooldown(aff.entry, domain)
+		delete(r.affinity, affinityKey)
 	}
 
-	se := r.pickSession(host)
+	se := r.pickSession(domain)
 	if se == nil {
 		return nil, errors.New("no exitnodes available")
 	}
 
-	r.affinity[host] = &affinityEntry{
+	r.affinity[affinityKey] = &affinityEntry{
 		entry:     se,
 		requests:  1,
 		expiresAt: r.randomExpiry(),

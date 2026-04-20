@@ -1,45 +1,97 @@
-# ambush
+<p align="center">
+  <img src="docs/ambush.png" alt="Ambush" width="180" />
+</p>
 
-> ⚠️ Early development — not production ready yet.
+# Ambush
 
-A custom residential proxy network written in Go from scratch.
+> ⚠️ Work in progress — not production ready yet.
 
-## What is this?
+A self-hosted, integration-agnostic proxy network written in Go. Machines running the exit node binary connect to a central gateway over WebSocket. Any SOCKS5-capable client routes its TCP traffic through the gateway, which tunnels it out through one of the connected exit nodes.
 
-A distributed proxy system where clients connect via SOCKS5 to a central gateway, which routes traffic through a pool of residential exit nodes. Exit nodes are regular machines running behind NAT that maintain a persistent WebSocket connection back to the gateway and perform the actual outbound TCP connections on behalf of clients.
+The network is **protocol-agnostic** — anything that runs over TCP works. The gateway and exit nodes have no awareness of what is being proxied.
 
 ```mermaid
 flowchart LR
-    C([Client]):::node
-    GW([Gateway]):::node
-    EN([Exit Node]):::node
-    D([Destination]):::node
+    C(["SOCKS5 Client\n(any app)"])
+    GW(["Gateway\n:8080 · :1080"])
+    EN1(["Exit Node 1"])
+    EN2(["Exit Node 2"])
+    T(["Target"])
 
-    C -->|SOCKS5 + auth| GW
-    GW <-->|WebSocket tunnel\nresidential IP| EN
-    EN -->|TCP| D
-
-    classDef node fill:#1e3a5f,stroke:#2d6a9f,color:#e8f4fd,rx:8
+    C -->|"SOCKS5 + auth"| GW
+    EN1 -->|"WebSocket + yamux"| GW
+    EN2 -->|"WebSocket + yamux"| GW
+    GW -->|"TCP stream"| EN1
+    GW -->|"TCP stream"| EN2
+    EN1 -->|TCP| T
 ```
 
-## Architecture
+## How it works
 
-- **Gateway** — accepts SOCKS5 connections from clients, authenticates them, and round-robins requests across available exit nodes
-- **Exit node** — runs on residential machines, connects to the gateway via WebSocket, and relays traffic to the destination
-- **SOCKS5** — implemented from scratch, currently supports IPv4 and domain resolution
+1. Exit nodes connect **outbound** to the gateway over WebSocket — no inbound ports needed, works from behind NAT
+2. The gateway multiplexes TCP streams over each WebSocket connection using [yamux](https://github.com/hashicorp/yamux)
+3. SOCKS5 clients connect to the gateway on `:1080` with username/password credentials
+4. The gateway's router picks an exit node based on domain affinity, routes the stream through it, and the exit node dials the real target
 
-## Status
+## Components
 
-Just started. Core SOCKS5 proxy works. Gateway and exit node tunnel are in progress.
+| Binary | Port | Role |
+|--------|------|------|
+| `gateway` | `:8080` (WS), `:1080` (SOCKS5) | Accepts exit node connections, serves SOCKS5 proxy, smart routing |
+| `exitnode` | — | Runs on any machine, connects to gateway, relays traffic |
+| `api` | `:8081` | Admin HTTP API — manage users, tokens, proxy credentials |
 
-- [ ] SOCKS5 handshake
-- [ ] IPv4 relay
-- [ ] Domain resolution
-- [ ] SOCKS5 auth
-- [ ] WebSocket tunnel (gateway ↔ exit node)
-- [ ] Exit node pool management
-- [ ] Health checks
+## Smart routing
+
+The router avoids assigning a random exit node per request. Instead:
+
+- Requests to the same domain stick to the same exit node for a time window (5 min ± 20% jitter)
+- After the window or 100 requests, the exit node rotates with a 10 minute cooldown
+- Each exit node is capped at 10 concurrent streams
+- Dead sessions are detected and retried transparently
+
+See [docs/routing.md](docs/routing.md) for the full decision flowchart.
+
+## Running locally
+
+**Gateway:**
+```bash
+# fill in DATABASE_URL in cmd/gateway/.env first
+./cmd/gateway/run.sh
+```
+
+**Exit node:**
+```bash
+# first run triggers interactive setup — paste your token when prompted
+./cmd/exitnode/run.sh
+```
+
+**API:**
+```bash
+# fill in DATABASE_URL and ADMIN_TOKEN in cmd/api/.env first
+./cmd/api/run.sh
+```
+
+**Test the proxy:**
+```bash
+./scripts/test-socks5.sh
+```
+
+## Database
+
+Run `db/schema.sql` against a Postgres instance before starting. Requires the `pgcrypto` extension (first line of the schema handles this).
+
+## Documentation
+
+| Doc | Contents |
+|-----|----------|
+| [docs/overview.md](docs/overview.md) | System overview, components, design decisions |
+| [docs/architecture.md](docs/architecture.md) | Connection flows, internal structure, shutdown sequence |
+| [docs/routing.md](docs/routing.md) | Smart routing strategy, affinity, rotation, cooldown |
+| [docs/database.md](docs/database.md) | Schema, ER diagram, who reads/writes what |
+| [docs/api.md](docs/api.md) | Full API reference with request/response examples |
+| [docs/roadmap.md](docs/roadmap.md) | What's done, what's blocked, what's next |
 
 ## License
 
-MIT — free to use, modify, and distribute. See [LICENSE](LICENSE) for details.
+MIT — see [LICENSE](LICENSE) for details.

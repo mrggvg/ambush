@@ -22,6 +22,16 @@ func newRequestID() string {
 	return hex.EncodeToString(b)
 }
 
+// newSessionToken returns a 32-character random hex string suitable for use
+// as a long-lived session token.
+func newSessionToken() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%032x", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
+}
+
 func withRequestID(ctx context.Context, id string) context.Context {
 	return context.WithValue(ctx, requestIDKey, id)
 }

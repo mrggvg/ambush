@@ -24,6 +24,8 @@ erDiagram
     exit_node_ips {
         uuid token_id FK
         inet ip
+        text country "nullable — self-reported ISO 3166-1 alpha-2"
+        text node_type "nullable — residential | datacenter | mobile"
         timestamptz first_seen_at
         timestamptz last_seen_at
     }
@@ -55,15 +57,22 @@ The raw token is returned once at creation time and never stored. The gateway st
 Tracks every unique public IP seen per token. Updated on each connection via upsert:
 
 ```sql
-INSERT INTO exit_node_ips (token_id, ip)
-VALUES ($1, $2)
-ON CONFLICT (token_id, ip) DO UPDATE SET last_seen_at = now()
+INSERT INTO exit_node_ips (token_id, ip, country, node_type)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (token_id, ip)
+DO UPDATE SET last_seen_at = now(),
+              country = EXCLUDED.country,
+              node_type = EXCLUDED.node_type
 ```
+
+`country` and `node_type` are self-reported by the exit node via query parameters on the WebSocket upgrade (`?country=us&type=residential`). Both are nullable — not all exit nodes set them.
 
 Basis for the IP diversity feature — the `user_exit_node_diversity` view aggregates unique IPs per user.
 
 ### `proxy_credentials`
 SOCKS5 username/password pairs. Passwords are hashed with bcrypt via pgcrypto's `gen_salt('bf')` at write time and verified with `crypt($password, password_hash)` at auth time — the hash never leaves the database.
+
+The gateway parses the SOCKS5 username before lookup: `alice-session-tok123` is looked up as `alice`. See [routing.md](routing.md) for the username format.
 
 ## Who writes what
 
@@ -76,7 +85,7 @@ SOCKS5 username/password pairs. Passwords are hashed with bcrypt via pgcrypto's 
 
 ## Connection pooling
 
-The gateway uses Supabase's pgBouncer pooler URL (port 5432 transaction mode) since it holds many short-lived SOCKS5 auth queries. The API uses direct connection (port 5432) since it has infrequent, longer transactions.
+The gateway uses pgBouncer pooler URL (port 5432 transaction mode) since it holds many short-lived SOCKS5 auth queries. The API uses direct connection since it has infrequent, longer transactions.
 
 ## Required extension
 

@@ -12,72 +12,63 @@ import (
 	"time"
 )
 
-const (
-	affinityBaseWindow = 5 * time.Minute
-	affinityJitter     = 0.20 // ±20% of base window
-	maxRequestsPerNode = 100
-	cooldownDuration   = 10 * time.Minute
-	maxStreamsPerNode   = 10
-)
+const maxStreamsPerNode = 10
 
-type affinityEntry struct {
-	entry     *sessionEntry
-	requests  int
-	expiresAt time.Time
-}
-
-// Router handles smart routing: domain affinity, rotation with cooldown,
-// per-exitnode concurrency limits, and per-credential rate limiting.
+// Router handles routing: per-exitnode concurrency limits, per-credential
+// rate limiting, and Model A (sticky) / Model B (fresh) session selection.
 type Router struct {
 	mu       sync.Mutex
 	pool     *Pool
 	limiter  *CredentialLimiter
 	metrics  *Metrics
-	affinity map[string]*affinityEntry // domain -> active assignment
-	cooldown map[string]time.Time      // "ip:domain" -> expires
+	sessions *SessionStore
 }
 
-func NewRouter(pool *Pool, limiter *CredentialLimiter, metrics *Metrics) *Router {
-	r := &Router{
+func NewRouter(pool *Pool, limiter *CredentialLimiter, metrics *Metrics, sessions *SessionStore) *Router {
+	return &Router{
 		pool:     pool,
 		limiter:  limiter,
 		metrics:  metrics,
-		affinity: make(map[string]*affinityEntry),
-		cooldown: make(map[string]time.Time),
-	}
-	go r.cleanupLoop()
-	return r
-}
-
-func (r *Router) cleanupLoop() {
-	ticker := time.NewTicker(cooldownDuration)
-	defer ticker.Stop()
-	for range ticker.C {
-		now := time.Now()
-		r.mu.Lock()
-		for key, exp := range r.cooldown {
-			if now.After(exp) {
-				delete(r.cooldown, key)
-			}
-		}
-		r.mu.Unlock()
+		sessions: sessions,
 	}
 }
 
-// DialWithUser is the core dial function. username scopes affinity so two
-// different SOCKS5 users hitting the same domain use different exit nodes.
+// CreateSession pre-allocates a session token bound to an eligible exit node.
+// The caller embeds the returned token in SOCKS5 usernames as "base-session-<token>"
+// to get Model A (sticky) routing for ttl. Returns an error if no eligible node exists.
+func (r *Router) CreateSession(c Constraints, ttl time.Duration) (token string, expiresAt time.Time, se *sessionEntry, err error) {
+	se = r.pickSessionExcluding(nil, c)
+	if se == nil {
+		return "", time.Time{}, nil, errors.New("no eligible exit nodes")
+	}
+	token = newSessionToken()
+	expiresAt = time.Now().Add(ttl)
+	r.sessions.SetWithTTL(token, se, ttl)
+	slog.Info("session pre-allocated", "token", token, "exitnode_id", se.id, "ttl", ttl)
+	return token, expiresAt, se, nil
+}
+
+// EvictSession removes all session-token bindings pointing to se.
+// Call when an exit node disconnects.
+func (r *Router) EvictSession(se *sessionEntry) {
+	r.sessions.EvictForSession(se)
+}
+
+// DialWithUser is the core dial function.
+// username is parsed so that structured variants share the same rate-limit slot.
 func (r *Router) DialWithUser(ctx context.Context, _, addr, username string) (net.Conn, error) {
 	reqID := requestIDFromCtx(ctx)
+	parsed := ParseUsername(username)
 
-	release, err := r.limiter.Acquire(username)
+	release, err := r.limiter.Acquire(parsed.Base)
 	if err != nil {
-		slog.Warn("credential rate limit exceeded", "req_id", reqID, "username", username, "active_streams", r.limiter.ActiveStreams(username))
+		slog.Warn("credential rate limit exceeded", "req_id", reqID, "username", parsed.Base, "active_streams", r.limiter.ActiveStreams(parsed.Base))
 		r.metrics.incCredLimitExceeded()
 		r.metrics.incDials("rate_limited")
 		return nil, err
 	}
 
-	conn, err := r.dial(addr, username, reqID)
+	conn, err := r.dial(addr, parsed, reqID)
 	if err != nil {
 		r.metrics.incDials("error")
 		release()
@@ -87,34 +78,54 @@ func (r *Router) DialWithUser(ctx context.Context, _, addr, username string) (ne
 	return &rateLimitedConn{Conn: conn, release: release}, nil
 }
 
-func (r *Router) dial(addr, username, reqID string) (net.Conn, error) {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		host = addr
+// Constraints optionally filters exit node selection by metadata.
+// Empty fields are unconstrained.
+type Constraints struct {
+	Country  string // ISO-3166-1 alpha-2, e.g. "us"
+	NodeType string // "residential" | "datacenter" | "mobile"
+}
+
+func (c Constraints) matches(se *sessionEntry) bool {
+	if c.Country != "" && se.country != c.Country {
+		return false
 	}
+	if c.NodeType != "" && se.nodeType != c.NodeType {
+		return false
+	}
+	return true
+}
 
-	affinityKey := username + ":" + host
+// dial dispatches to Model A (sticky) or Model B (fresh) based on SessionToken.
+func (r *Router) dial(addr string, parsed ParsedUsername, reqID string) (net.Conn, error) {
+	c := Constraints{Country: parsed.Country}
+	if parsed.SessionToken != "" {
+		return r.dialWithSession(addr, parsed, reqID, c)
+	}
+	return r.dialFresh(addr, parsed.Base, reqID, c)
+}
 
-	se, err := r.assignSession(affinityKey, host)
-	if err != nil {
-		return nil, err
+// dialFresh picks a new exit node on every call (Model B).
+func (r *Router) dialFresh(addr, username, reqID string, c Constraints) (net.Conn, error) {
+	se := r.pickSessionExcluding(nil, c)
+	if se == nil {
+		slog.Warn("no eligible exit nodes", "req_id", reqID, "addr", addr, "pool_size", len(r.pool.snapshot()))
+		return nil, errors.New("no exitnodes available")
 	}
 
 	conn, err := r.openStream(se, addr, username, reqID)
 	if err != nil {
-		// session died between selection and open — record the failure, clear affinity, retry once
 		se.health.record(false)
 		r.metrics.incStreamErrors(strconv.FormatUint(se.id, 10))
 		slog.Warn("stream open failed, retrying with new session", "req_id", reqID, "exitnode_id", se.id, "addr", addr, "error", err)
-		r.clearAffinity(affinityKey)
-		se, err = r.assignSession(affinityKey, host)
-		if err != nil {
-			return nil, err
+
+		se2 := r.pickSessionExcluding(se, c)
+		if se2 == nil {
+			return nil, errors.New("no exitnodes available after retry")
 		}
-		conn, err = r.openStream(se, addr, username, reqID)
+		conn, err = r.openStream(se2, addr, username, reqID)
 		if err != nil {
-			se.health.record(false)
-			r.metrics.incStreamErrors(strconv.FormatUint(se.id, 10))
+			se2.health.record(false)
+			r.metrics.incStreamErrors(strconv.FormatUint(se2.id, 10))
 			return nil, err
 		}
 		return conn, nil
@@ -122,66 +133,57 @@ func (r *Router) dial(addr, username, reqID string) (net.Conn, error) {
 	return conn, nil
 }
 
-func (r *Router) clearAffinity(key string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	delete(r.affinity, key)
-}
+// dialWithSession pins all requests for a token to the same exit node (Model A).
+// If the pinned node is dead or the token is new, a fresh node is selected and stored.
+func (r *Router) dialWithSession(addr string, parsed ParsedUsername, reqID string, c Constraints) (net.Conn, error) {
+	token := parsed.SessionToken
 
-func (r *Router) assignSession(affinityKey, domain string) (*sessionEntry, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if aff := r.affinity[affinityKey]; aff != nil {
-		if r.isAffinityValid(aff) {
-			aff.requests++
-			return aff.entry, nil
+	if se := r.sessions.Get(token); se != nil && !se.session.IsClosed() {
+		conn, err := r.openStream(se, addr, parsed.Base, reqID)
+		if err == nil {
+			slog.Info("session reused", "req_id", reqID, "token", token, "exitnode_id", se.id)
+			return conn, nil
 		}
-		// rotate — only apply domain cooldown for deliberate anti-bot rotations
-		// (budget/expiry). session_closed and concurrency are infrastructure events;
-		// cooling down the IP would block a reconnected node or a node that just
-		// freed up capacity.
-		reason := r.rotationReason(aff)
-		r.metrics.incRotations(reason)
-		if reason == "budget" || reason == "expiry" {
-			r.setCooldown(aff.entry, domain)
-		}
-		delete(r.affinity, affinityKey)
+		se.health.record(false)
+		r.metrics.incStreamErrors(strconv.FormatUint(se.id, 10))
+		slog.Warn("session stream failed, re-assigning", "req_id", reqID, "token", token, "exitnode_id", se.id, "error", err)
+		r.sessions.Delete(token)
 	}
 
-	se := r.pickSession(domain)
+	se := r.pickSessionExcluding(nil, c)
 	if se == nil {
-		slog.Warn("no eligible exit nodes", "domain", domain, "pool_size", len(r.pool.snapshot()))
+		slog.Warn("no eligible exit nodes", "req_id", reqID, "addr", addr, "pool_size", len(r.pool.snapshot()))
 		return nil, errors.New("no exitnodes available")
 	}
+	r.sessions.Set(token, se)
 
-	r.affinity[affinityKey] = &affinityEntry{
-		entry:     se,
-		requests:  1,
-		expiresAt: r.randomExpiry(),
+	conn, err := r.openStream(se, addr, parsed.Base, reqID)
+	if err != nil {
+		se.health.record(false)
+		r.metrics.incStreamErrors(strconv.FormatUint(se.id, 10))
+		r.sessions.Delete(token)
+		return nil, err
 	}
-	return se, nil
+	slog.Info("session bound to exit node", "req_id", reqID, "token", token, "exitnode_id", se.id)
+	return conn, nil
 }
 
-func (r *Router) isAffinityValid(aff *affinityEntry) bool {
-	return !aff.entry.session.IsClosed() &&
-		time.Now().Before(aff.expiresAt) &&
-		aff.requests < maxRequestsPerNode &&
-		aff.entry.activeStreams.Load() < maxStreamsPerNode
-}
-
-// pickSession selects an eligible session for the given domain.
-// Excludes sessions in cooldown or at their concurrency limit.
-// Healthy nodes (failure rate below threshold) are preferred; degraded nodes
-// are used only when no healthy nodes are available.
-func (r *Router) pickSession(domain string) *sessionEntry {
+// pickSessionExcluding selects a random eligible exit node, skipping exclude (may be nil)
+// and applying c. Healthy nodes are preferred; degraded nodes used as last resort.
+func (r *Router) pickSessionExcluding(exclude *sessionEntry, c Constraints) *sessionEntry {
 	candidates := r.pool.snapshot()
 	var healthy, degraded []*sessionEntry
 	for _, se := range candidates {
+		if exclude != nil && se.id == exclude.id {
+			continue
+		}
+		if se.session.IsClosed() {
+			continue
+		}
 		if se.activeStreams.Load() >= maxStreamsPerNode {
 			continue
 		}
-		if exp, ok := r.cooldown[se.ip+":"+domain]; ok && time.Now().Before(exp) {
+		if !c.matches(se) {
 			continue
 		}
 		if se.health.isDegraded() {
@@ -194,8 +196,7 @@ func (r *Router) pickSession(domain string) *sessionEntry {
 		return healthy[rand.IntN(len(healthy))]
 	}
 	if len(degraded) > 0 {
-		slog.Warn("all eligible exit nodes are degraded, using fallback",
-			"domain", domain, "degraded_count", len(degraded))
+		slog.Warn("all eligible exit nodes are degraded, using fallback", "degraded_count", len(degraded))
 		return degraded[rand.IntN(len(degraded))]
 	}
 	return nil
@@ -216,29 +217,4 @@ func (r *Router) openStream(se *sessionEntry, addr, username, reqID string) (net
 	r.metrics.incStreams(strconv.FormatUint(se.id, 10))
 	slog.Info("stream opened", "req_id", reqID, "exitnode_id", se.id, "addr", addr, "username", username)
 	return &trackedConn{Conn: stream, entry: se, pool: r.pool, metrics: r.metrics}, nil
-}
-
-func (r *Router) setCooldown(se *sessionEntry, domain string) {
-	r.cooldown[se.ip+":"+domain] = time.Now().Add(cooldownDuration)
-}
-
-// rotationReason returns a Prometheus label describing why an affinity entry became invalid.
-// Conditions are checked in priority order: a closed session is the root cause even if the
-// budget is also exhausted.
-func (r *Router) rotationReason(aff *affinityEntry) string {
-	if aff.entry.session.IsClosed() {
-		return "session_closed"
-	}
-	if !time.Now().Before(aff.expiresAt) {
-		return "expiry"
-	}
-	if aff.requests >= maxRequestsPerNode {
-		return "budget"
-	}
-	return "concurrency"
-}
-
-func (r *Router) randomExpiry() time.Time {
-	jitter := float64(affinityBaseWindow) * (1 + (rand.Float64()*2-1)*affinityJitter)
-	return time.Now().Add(time.Duration(jitter))
 }

@@ -5,34 +5,48 @@
 ### Core tunnel
 - [x] Exit node connects to gateway over WebSocket (`/exitnode?token=xxx`)
 - [x] yamux multiplexes streams over the WebSocket connection
-- [x] Exit node accepts yamux streams, reads target address, dials out, relays bidirectionally
+- [x] Exit node accepts yamux streams, reads `reqID addr` header, dials out, relays bidirectionally
 - [x] Exit node setup via interactive terminal form (huh) — token saved to `~/.ambush/exitnode.json`
-- [x] Exit node reconnects automatically on disconnect (5s retry loop)
+- [x] Exponential backoff with jitter on reconnect (1s → 60s cap) — prevents thundering herd on gateway restart
+- [x] `wsConn.SetDeadline` sets both read and write deadlines in exit node and gateway — prevents goroutine leaks on stalled connections
 
 ### Gateway
 - [x] WebSocket upgrade and yamux server session per exit node
 - [x] Exit node pool with add/remove lifecycle
 - [x] SOCKS5 server on `:1080` with username/password authentication
 - [x] DB auth — exit node tokens validated via SHA-256 hash lookup
-- [x] DB auth — SOCKS5 credentials validated via bcrypt (`pgcrypto`)
+- [x] DB auth — SOCKS5 credentials validated via bcrypt (`pgcrypto`); base credential extracted from structured username
 - [x] `is_active` and `expires_at` checks on token validation
-- [x] IP tracking — upsert to `exit_node_ips` on each exit node connect
+- [x] IP tracking — upsert to `exit_node_ips` (with `country` and `node_type`) on each exit node connect
 - [x] WebSocket ping/pong keepalive (30s interval, 10s pong timeout)
 - [x] Graceful shutdown — drain streams, close sessions, shutdown HTTP server
 - [x] Health endpoint `GET /health` — pool size and active streams
-- [x] Fallback on dead session — retry with another exit node if stream open fails
+- [x] Fallback on dead session — retry with a different exit node (excluding failed) if stream open fails
+- [x] Rate limit on failed token auth attempts — 10 failures/min → 15-min block per IP (`authRateLimiter`)
 
-### Smart routing
-- [x] Domain affinity — same domain routes through same exit node within a window
-- [x] Time-based rotation with jitter (5min base ± 20%)
-- [x] Request budget per assignment (100 requests max before rotation)
-- [x] Cooldown after rotation — rotated exit node excluded from domain for 10min; keyed by public IP so exit nodes sharing the same NAT address are treated as one unit
+### Routing
+- [x] Model B — fresh exit per connection (default); maximises IP diversity and throughput
+- [x] Model A — sticky sessions via `alice-session-<token>` SOCKS5 username; `SessionStore` with TTL and dead-node eviction
+- [x] SOCKS5 username parsing — `base[-key-val...]` format; `session` and `country` keys; base used for auth and rate limiting
+- [x] Geo-filtering — exit nodes self-report `AMBUSH_COUNTRY` / `AMBUSH_TYPE`; `Constraints` filter applied in `pickSession`; `alice-country-us` routes to US nodes
 - [x] Concurrency limit per exit node (max 10 concurrent streams)
+- [x] Per-credential rate limiting — cap on concurrent streams per SOCKS5 base credential (`MAX_STREAMS_PER_CREDENTIAL`, default 20)
 - [x] Stream idle timeout — 2min idle closes hung connections
-- [x] Per-user affinity — different SOCKS5 users hitting the same domain use different exit nodes (`WithDialAndRequest` + `username:host` affinity key)
-- [x] Per-credential rate limiting — cap on concurrent open streams per SOCKS5 username (`MAX_STREAMS_PER_CREDENTIAL`, default 20)
+- [x] Request correlation IDs — 12-char hex ID per SOCKS5 request, carried through all gateway log lines and written into the yamux stream header so exit node logs use the same ID
 
-### API
+### Health & observability
+- [x] Structured logging with `slog` (JSON output, consistent field names)
+- [x] Exit node health scoring — rolling 20-outcome window per node; degraded nodes deprioritised but not removed (`nodeHealth`)
+- [x] `ambush_streams_active{exitnode_id}` and `ambush_stream_errors_total{exitnode_id}` — per-node Prometheus metrics
+
+### Gateway API (`/api/v1/*`)
+- [x] `GET /api/v1/exits` — live pool snapshot with per-node metadata and health
+- [x] `GET /api/v1/stats` — aggregate exitnode count and active stream count
+- [x] `POST /api/v1/sessions` — pre-allocate a sticky session token with optional TTL and Constraints; returns token + exit info
+- [x] `POST /api/v1/feedback` — record target-level outcome into node health without a new SOCKS5 connection
+- [x] Bearer-token protection via `GATEWAY_ADMIN_TOKEN`; disabled (no routes mounted) if env var is unset
+
+### Admin API (`cmd/api`)
 - [x] User management (create, list)
 - [x] Exit node token management (create, list, revoke)
 - [x] Proxy credential management (create, list, revoke)
@@ -40,55 +54,25 @@
 - [x] Bruno collection for all endpoints
 
 ### Database
-- [x] Schema with `users`, `exit_node_tokens`, `exit_node_ips`, `proxy_credentials`
+- [x] Schema with `users`, `exit_node_tokens`, `exit_node_ips` (+ `country`, `node_type`), `proxy_credentials`
 - [x] `user_exit_node_diversity` view
 - [x] Hosted on Supabase
-
-### Gateway
-- [x] `wsConn.SetDeadline` sets both read and write deadlines — previously only write was set, causing goroutine leaks on stalled connections
-
-### Observability
-- [x] Structured logging with `slog` (JSON output, consistent field names) in gateway
 
 ### Deployment
 - [x] Dockerfile for gateway and API
 - [x] Dockerfile for exit node
 
-### Security & correctness
-- [x] Rate limit on failed token auth attempts — 10 failures/min → 15-min block per IP (`authRateLimiter`)
-- [x] Cooldown only applied on deliberate rotations (budget/expiry) — `session_closed` and `concurrency` no longer block a reconnected node
-
-### Routing improvements
-- [x] Exit node health scoring — rolling window of stream-open outcomes per node; degraded nodes deprioritised without being removed (`nodeHealth`)
-- [x] Request correlation IDs — short random hex ID generated per SOCKS5 request, carried through all gateway log lines and written into the yamux stream header so exit node logs use the same ID
-
-### Per-node observability
-- [x] `ambush_streams_active{exitnode_id}` and `ambush_stream_errors_total{exitnode_id}` — per-node breakdown to identify slow or blocked exit nodes
-
-### Exit node reliability
-- [x] Exponential backoff with jitter on reconnect (1s → 60s cap) — prevents thundering herd on gateway restart
-- [x] `wsConn.SetDeadline` sets both read and write deadlines in exit node (mirrors gateway fix)
-
 ### Testing
-- [x] Unit tests for router — affinity, rotation, cooldown, concurrency limit, IP-based grouping
-- [x] Unit tests for pool, rate limiter, wsConn, auth rate limiter, node health
-- [x] CI runs unit tests with race detector (`go test ./cmd/... -race`) before E2E
+- [x] Unit tests for router (Model A/B, Constraints, concurrency limit, health scoring, retry)
+- [x] Unit tests for SessionStore, username parser, credential limiter, pool, wsConn, auth rate limiter, node health, gateway API
+- [x] CI — unit tests with race detector (`go test ./cmd/... -race`) before E2E
 - [x] E2E — basic traffic flow through gateway (TLS) → exit node → echo server
-- [x] E2E — multiple sequential requests (affinity persistence)
-- [x] E2E — exit node reconnect: kill, wait for pool=0, restart, verify requests succeed without cooldown blocking
+- [x] E2E — multiple sequential requests
+- [x] E2E — exit node reconnect: kill → pool=0 → restart → requests succeed
 
 ---
 
 ## TODO
-
-### Security & correctness
-- [ ] Per-user exit node diversity guarantee
-
-### Observability
-- [ ] TLS on the exit node ↔ gateway tunnel — self-signed CA, no domain required (see [docs/tls.md](tls.md))
-
-### Routing improvements
-- [ ] Geo-awareness — record exit node country, allow SOCKS5 clients to request a specific region via credentials
 
 ### Deployment
 - [ ] systemd unit file for exit node (run as a persistent background service)
@@ -106,12 +90,3 @@ Ambush is a **self-contained, integration-agnostic proxy network**. It owns its 
 The network is **protocol-agnostic**. Because traffic is tunnelled as raw TCP streams, anything that runs over TCP works: HTTP, HTTPS, any proprietary protocol. The gateway and exit nodes have no awareness of what is being proxied.
 
 Ambush does not dictate how credentials are issued, how users are onboarded, or what the traffic is used for. That is the responsibility of whatever system integrates with it.
-
----
-
-## Priority order (suggested)
-
-1. **End-to-end test** — verify the system actually works before building more on top of it
-2. **systemd unit file** — so exit nodes can run as persistent background services without Docker
-3. **Prometheus metrics** — active exit nodes, requests/s, rotation events; needed once deployed at scale
-4. **Per-user diversity guarantee** — today multiple users can land on the same exit node; fix requires tracking assignments across users in `pickSession`

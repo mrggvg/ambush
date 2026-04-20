@@ -192,6 +192,12 @@ func connect(cfg *Config) error {
 	u.Path = "/exitnode"
 	q := u.Query()
 	q.Set("token", cfg.Token)
+	if country := os.Getenv("AMBUSH_COUNTRY"); country != "" {
+		q.Set("country", country)
+	}
+	if nodeType := os.Getenv("AMBUSH_TYPE"); nodeType != "" {
+		q.Set("type", nodeType)
+	}
 	u.RawQuery = q.Encode()
 
 	dialer := websocket.DefaultDialer

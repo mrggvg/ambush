@@ -141,8 +141,7 @@ func TestDialWithUser_CredentialLimitEnforced(t *testing.T) {
 	r := &Router{
 		pool:     p,
 		limiter:  NewCredentialLimiter(2), // tight per-credential cap
-		affinity: make(map[string]*affinityEntry),
-		cooldown: make(map[string]time.Time),
+		sessions: NewSessionStore(context.Background(), time.Hour),
 	}
 
 	conn1, err := r.DialWithUser(context.Background(), "tcp", "example.com:80", "alice")
@@ -183,8 +182,7 @@ func TestDialWithUser_CredentialReleasedOnClose(t *testing.T) {
 	r := &Router{
 		pool:     p,
 		limiter:  NewCredentialLimiter(1),
-		affinity: make(map[string]*affinityEntry),
-		cooldown: make(map[string]time.Time),
+		sessions: NewSessionStore(context.Background(), time.Hour),
 	}
 
 	conn, err := r.DialWithUser(context.Background(), "tcp", "example.com:80", "alice")

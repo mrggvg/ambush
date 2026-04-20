@@ -14,7 +14,6 @@ type Metrics struct {
 	exitnodesActive   prometheus.Gauge
 	streamsActive     *prometheus.GaugeVec   // label: exitnode_id
 	dialsTotal        *prometheus.CounterVec // label: result
-	rotationsTotal    *prometheus.CounterVec // label: reason
 	streamErrorsTotal *prometheus.CounterVec // label: exitnode_id
 	credLimitExceeded prometheus.Counter
 }
@@ -35,10 +34,6 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "ambush_dials_total",
 			Help: "Total dial attempts by result (success | no_exitnodes | stream_error | rate_limited).",
 		}, []string{"result"}),
-		rotationsTotal: f.NewCounterVec(prometheus.CounterOpts{
-			Name: "ambush_rotations_total",
-			Help: "Total affinity rotation events by reason (budget | expiry | session_closed | concurrency).",
-		}, []string{"reason"}),
 		streamErrorsTotal: f.NewCounterVec(prometheus.CounterOpts{
 			Name: "ambush_stream_errors_total",
 			Help: "Total stream open failures (yamux session died between selection and open), by exit node.",
@@ -64,5 +59,4 @@ func (m *Metrics) decStreams(id string)                 { if m != nil { m.stream
 func (m *Metrics) deleteExitnodeStreams(id string)      { if m != nil { m.streamsActive.DeleteLabelValues(id) } }
 func (m *Metrics) incStreamErrors(id string)            { if m != nil { m.streamErrorsTotal.WithLabelValues(id).Inc() } }
 func (m *Metrics) incCredLimitExceeded()                { if m != nil { m.credLimitExceeded.Inc() } }
-func (m *Metrics) incDials(result string)               { if m != nil { m.dialsTotal.WithLabelValues(result).Inc() } }
-func (m *Metrics) incRotations(reason string)           { if m != nil { m.rotationsTotal.WithLabelValues(reason).Inc() } }
+func (m *Metrics) incDials(result string) { if m != nil { m.dialsTotal.WithLabelValues(result).Inc() } }

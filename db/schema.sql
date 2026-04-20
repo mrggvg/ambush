@@ -25,8 +25,10 @@ CREATE INDEX idx_exit_node_tokens_token_hash ON exit_node_tokens(token_hash);
 
 -- Tracks unique public IPs seen per token (basis for IP diversity metrics).
 CREATE TABLE exit_node_ips (
-    token_id     UUID        NOT NULL REFERENCES exit_node_tokens(id) ON DELETE CASCADE,
-    ip           INET        NOT NULL,
+    token_id      UUID        NOT NULL REFERENCES exit_node_tokens(id) ON DELETE CASCADE,
+    ip            INET        NOT NULL,
+    country       TEXT,                                    -- self-reported ISO-3166-1 alpha-2, NULL if not set
+    node_type     TEXT,                                    -- "residential" | "datacenter" | "mobile", NULL if not set
     first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_seen_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (token_id, ip)

@@ -37,6 +37,7 @@ type dbCredentialStore struct {
 }
 
 func (s *dbCredentialStore) Valid(user, password, _ string) bool {
+	base := ParseUsername(user).Base
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancel()
 	var ok bool
@@ -46,10 +47,10 @@ func (s *dbCredentialStore) Valid(user, password, _ string) bool {
 			WHERE username = $1
 			  AND password_hash = crypt($2, password_hash)
 			  AND is_active = true
-		)`, user, password,
+		)`, base, password,
 	).Scan(&ok)
 	if err != nil {
-		slog.Error("socks5 auth failed", "username", user, "error", err)
+		slog.Error("socks5 auth failed", "username", base, "error", err)
 		return false
 	}
 	return ok
@@ -74,7 +75,7 @@ func validateExitNodeToken(ctx context.Context, db *pgxpool.Pool, token string) 
 	return id
 }
 
-func trackExitNodeIP(ctx context.Context, db *pgxpool.Pool, tokenID, remoteAddr string) {
+func trackExitNodeIP(ctx context.Context, db *pgxpool.Pool, tokenID, remoteAddr, country, nodeType string) {
 	ctx, cancel := context.WithTimeout(ctx, dbTimeout)
 	defer cancel()
 	ip, _, err := net.SplitHostPort(remoteAddr)
@@ -82,11 +83,18 @@ func trackExitNodeIP(ctx context.Context, db *pgxpool.Pool, tokenID, remoteAddr 
 		slog.Error("ip tracking: parse addr failed", "addr", remoteAddr, "error", err)
 		return
 	}
+	var countryVal, nodeTypeVal *string
+	if country != "" {
+		countryVal = &country
+	}
+	if nodeType != "" {
+		nodeTypeVal = &nodeType
+	}
 	_, err = db.Exec(ctx,
-		`INSERT INTO exit_node_ips (token_id, ip)
-		 VALUES ($1, $2)
-		 ON CONFLICT (token_id, ip) DO UPDATE SET last_seen_at = now()`,
-		tokenID, ip,
+		`INSERT INTO exit_node_ips (token_id, ip, country, node_type)
+		 VALUES ($1, $2, $3, $4)
+		 ON CONFLICT (token_id, ip) DO UPDATE SET last_seen_at = now(), country = EXCLUDED.country, node_type = EXCLUDED.node_type`,
+		tokenID, ip, countryVal, nodeTypeVal,
 	)
 	if err != nil {
 		slog.Error("ip tracking: upsert failed", "token_id", tokenID, "ip", ip, "error", err)
@@ -140,7 +148,11 @@ func main() {
 		}
 	}
 	slog.Info("credential rate limit configured", "max_streams_per_credential", maxStreams)
-	router := NewRouter(pool, NewCredentialLimiter(maxStreams), metrics)
+	sessions := NewSessionStore(ctx, defaultSessionTTL)
+	router := NewRouter(pool, NewCredentialLimiter(maxStreams), metrics, sessions)
+
+	api := &GatewayAPI{pool: pool, sessions: sessions, router: router, token: os.Getenv("GATEWAY_ADMIN_TOKEN")}
+	api.Register(http.DefaultServeMux)
 
 	http.Handle("/metrics", MetricsHandler(reg))
 
@@ -166,7 +178,8 @@ func main() {
 			return
 		}
 
-		tokenID := validateExitNodeToken(r.Context(), db, r.URL.Query().Get("token"))
+		q := r.URL.Query()
+		tokenID := validateExitNodeToken(r.Context(), db, q.Get("token"))
 		if tokenID == "" {
 			authLimiter.recordFailure(remoteIP)
 			if authLimiter.blocked(remoteIP) {
@@ -177,7 +190,9 @@ func main() {
 		}
 		authLimiter.recordSuccess(remoteIP)
 
-		trackExitNodeIP(r.Context(), db, tokenID, r.RemoteAddr)
+		country := q.Get("country")
+		nodeType := q.Get("type")
+		trackExitNodeIP(r.Context(), db, tokenID, r.RemoteAddr, country, nodeType)
 
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
@@ -215,7 +230,9 @@ func main() {
 		}()
 
 		entry := newSessionEntry(session, remoteIP)
-		slog.Info("exitnode connected", "exitnode_id", entry.id, "ip", remoteIP, "token_id", tokenID)
+		entry.country = country
+		entry.nodeType = nodeType
+		slog.Info("exitnode connected", "exitnode_id", entry.id, "ip", remoteIP, "token_id", tokenID, "country", country, "node_type", nodeType)
 		pool.add(entry)
 		if peers := pool.byIP(remoteIP); len(peers) > 1 {
 			slog.Warn("multiple exit nodes share the same public IP — they will share cooldown slots per domain",
@@ -224,6 +241,7 @@ func main() {
 		defer func() {
 			slog.Info("exitnode disconnected", "exitnode_id", entry.id, "ip", remoteIP)
 			pool.remove(entry)
+			router.EvictSession(entry)
 			_ = session.Close()
 		}()
 

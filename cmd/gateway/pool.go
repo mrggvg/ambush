@@ -16,6 +16,8 @@ var sessionIDCounter atomic.Uint64
 type sessionEntry struct {
 	id           uint64
 	ip           string // public IP of the exit node as seen by the gateway
+	country      string // self-reported ISO-3166-1 alpha-2, empty if not set
+	nodeType     string // "residential" | "datacenter" | "mobile", empty if not set
 	session      *yamux.Session
 	activeStreams atomic.Int32
 	health       nodeHealth

@@ -1,81 +1,181 @@
-# Smart Routing
+# Routing
 
-The gateway's router (`cmd/gateway/router.go`) is responsible for deciding which exit node handles each SOCKS5 connection. Random routing would cause the same domain to see many different IPs in a short window, which looks bot-like. The router implements domain affinity with time-based rotation.
+The gateway's router (`cmd/gateway/router.go`) decides which exit node handles each SOCKS5 connection. It supports two routing models selected by the SOCKS5 username, plus geo-filtering via exit node metadata.
 
-## Routing decision flow
+## SOCKS5 username format
+
+The username carries structured options encoded as hyphen-separated key-value pairs after the base credential:
+
+```
+base[-key1-val1[-key2-val2...]]
+```
+
+Known keys:
+
+| Key | Value | Effect |
+|-----|-------|--------|
+| `session` | any string | Enable Model A (sticky) routing for this token |
+| `country` | ISO 3166-1 alpha-2 | Restrict selection to exit nodes in this country |
+
+Unknown keys and their values are silently ignored. Values must not contain hyphens.
+
+**Examples:**
+
+| Username | Behaviour |
+|----------|-----------|
+| `alice` | Model B — fresh exit per connection |
+| `alice-country-us` | Model B — fresh exit from US nodes only |
+| `alice-session-abc123` | Model A — all requests stick to the node bound to `abc123` |
+| `alice-session-abc123-country-gb` | Model A — sticky to a GB node |
+
+The base credential (`alice`) is used for database authentication and per-credential rate limiting. Structured variants (`alice-session-tok`) share the same rate-limit slot as the bare credential.
+
+---
+
+## Model B — fresh exit per connection (default)
+
+Every connection picks an exit node at random from the eligible pool. No state is kept between connections.
 
 ```mermaid
 flowchart TD
-    A[New SOCKS5 CONNECT\nexample.com:443] --> RL{Under per-credential\nstream limit?}
-    RL -->|No — limit reached| RLE[Error: rate limit exceeded]
-    RL -->|Yes| B{Affinity entry\nfor example.com?}
-
-    B -->|Yes| C{Is entry valid?}
-    C --> C1{Session alive?}
-    C1 -->|No| E
-    C1 -->|Yes| C2{Within time window?}
-    C2 -->|No| E
-    C2 -->|Yes| C3{Under request budget?}
-    C3 -->|No| E
-    C3 -->|Yes| C4{Under concurrency limit?}
-    C4 -->|No| E
-    C4 -->|Yes| D[Reuse assigned exit node\nrequests++]
-
-    B -->|No| E[Set cooldown on old exit node\nDelete affinity entry]
-    E --> F[pickSession]
-
-    F --> G{Any eligible sessions?\nalive + under concurrency limit\n+ not in cooldown for domain}
-    G -->|None| H[Error: no exitnodes available]
-    G -->|Some| I[Pick randomly\nCreate new affinity entry]
-
-    D --> J[openStream]
-    I --> J
-
-    J --> K{stream.Open succeeds?}
-    K -->|Yes| L[Write target addr\nReturn stream to SOCKS5]
-    K -->|No| M[clearAffinity\nRetry once with new session]
-    M --> N{Retry succeeds?}
-    N -->|Yes| L
-    N -->|No| H
+    A[New SOCKS5 CONNECT] --> RL{Under per-credential\nstream limit?}
+    RL -->|No| RLE[Error: rate limit exceeded]
+    RL -->|Yes| P[pickSession\napply Constraints]
+    P --> E{Eligible node found?}
+    E -->|No| ERR[Error: no exitnodes available]
+    E -->|Yes| OS[openStream]
+    OS --> OK{stream.Open succeeds?}
+    OK -->|Yes| RELAY[Relay data]
+    OK -->|No| RETRY[pickSession excluding failed node]
+    RETRY --> OK2{Retry succeeds?}
+    OK2 -->|Yes| RELAY
+    OK2 -->|No| ERR
 ```
 
-## Affinity budget
+**Properties:**
+- Maximum IP diversity — each new connection may use a different exit node
+- Maximum throughput — no sticky routing means the full pool is always eligible
+- One retry on stream-open failure, excluding the failed node
 
-Each `(domain → exit node)` assignment has two limits. Whichever is hit first triggers rotation:
+---
 
-| Parameter | Default | Meaning |
-|-----------|---------|---------|
-| `affinityBaseWindow` | 5 minutes | Time window with ±20% jitter |
-| `maxRequestsPerNode` | 100 | Max requests before rotation |
-| `cooldownDuration` | 10 minutes | How long a rotated exit node is excluded from that domain |
-| `maxStreamsPerNode` | 10 | Max concurrent streams per exit node |
+## Model A — sticky sessions (opt-in)
 
-The jitter (±20%) prevents all domains from rotating at the same time, which would cause a sudden IP change wave.
+When the username contains a `session` key, all connections sharing that token are pinned to the same exit node for the token's TTL.
 
-## Cooldown and public IP grouping
+```mermaid
+flowchart TD
+    A[New SOCKS5 CONNECT\nalice-session-tok123] --> RL{Under per-credential\nstream limit?}
+    RL -->|No| RLE[Error: rate limit exceeded]
+    RL -->|Yes| LOOKUP{Token in\nSessionStore?}
+    LOOKUP -->|Yes, node alive| OS[openStream on pinned node]
+    LOOKUP -->|No / node dead| PICK[pickSession\napply Constraints]
+    PICK --> STORE[Store token → node\nin SessionStore]
+    STORE --> OS
+    OS --> OK{stream.Open succeeds?}
+    OK -->|Yes| RELAY[Relay data]
+    OK -->|No| CLEAR[Delete token from store\nreturn error]
+```
 
-Cooldown is keyed by `publicIP:domain`, not by session ID. If two exit nodes share the same public IP address (for example, two devices behind the same home NAT router), they are treated as a single unit for cooldown purposes: rotating away from one blocks both for that domain. Rotating between two sessions on the same IP would provide no benefit to the target site.
+**Properties:**
+- All requests with `alice-session-tok123` go through the same exit node
+- If the pinned node disconnects, `EvictSession` clears the token automatically; the next request picks a fresh node and rebinds
+- TTL default: 30 minutes. Configurable via `POST /api/v1/sessions`
+- Session tokens are 32-character random hex strings
 
-The gateway logs a warning when multiple exit nodes connect from the same public IP.
+### Pre-allocating sessions
+
+A scraper that wants to pre-warm sessions before a crawl run can call:
+
+```
+POST /api/v1/sessions
+```
+
+```json
+{
+  "ttl_seconds": 1800,
+  "country": "us",
+  "node_type": "residential"
+}
+```
+
+Response:
+
+```json
+{
+  "token": "a3f9c2d1e8b74f6a9d3e2c1b0f8a7e5d",
+  "expires_at": "2026-04-20T15:30:00Z",
+  "exit": {
+    "id": "42",
+    "ip": "1.2.3.4",
+    "country": "us",
+    "node_type": "residential"
+  }
+}
+```
+
+The scraper embeds the token in SOCKS5 usernames: `myuser-session-a3f9c2d1e8b74f6a9d3e2c1b0f8a7e5d`.
+
+---
+
+## Geo-filtering with Constraints
+
+Exit nodes self-report their country and type when connecting:
+
+```
+/exitnode?token=xxx&country=us&type=residential
+```
+
+Set via environment variables on the exit node:
+
+```bash
+AMBUSH_COUNTRY=us
+AMBUSH_TYPE=residential   # residential | datacenter | mobile
+```
+
+Constraints are applied in `pickSession` before the health/concurrency check. An empty constraint is unconstrained (selects from the full pool).
+
+Both Model A and Model B honour the `country` key in the SOCKS5 username. `POST /api/v1/sessions` additionally accepts `node_type`.
+
+---
+
+## Health scoring
+
+Each exit node maintains a rolling window of the last 20 stream-open outcomes. If the failure rate exceeds 50% (with at least 5 observations), the node is classified as **degraded**.
+
+`pickSession` splits candidates into two tiers:
+
+1. **Healthy** — selected from first; a random node is chosen from this tier
+2. **Degraded** — used only when no healthy nodes are available; a warning is logged
+
+Outcomes are recorded:
+- On successful `openStream` — success
+- On `yamux.Open()` failure — failure
+- Via `POST /api/v1/feedback` — allows external callers (the scraper) to report target-level failures
+
+---
+
+## Per-node concurrency limit
+
+Each exit node has an `activeStreams` counter. Nodes at `maxStreamsPerNode` (default 10) are excluded from `pickSession`. This prevents one residential IP from handling dozens of simultaneous connections, which looks datacenter-like.
+
+```
+maxStreamsPerNode = 10
+```
+
+---
 
 ## Per-credential rate limiting
 
-Each SOCKS5 credential (username) has a cap on the total number of concurrent open streams, regardless of which exit nodes those streams are on. This prevents a single credential from monopolising the entire pool.
+Each SOCKS5 base credential has a cap on total concurrent open streams across all exit nodes.
 
 | Parameter | Default | Env var |
 |-----------|---------|---------|
-| `maxStreamsPerCredential` | 20 | `MAX_STREAMS_PER_CREDENTIAL` |
+| `MAX_STREAMS_PER_CREDENTIAL` | 20 | `MAX_STREAMS_PER_CREDENTIAL` |
 
-When the limit is reached, new connection attempts from that credential are rejected immediately with an error. Existing streams are unaffected. The slot is released automatically when the stream closes.
+When the limit is reached, new connections from that credential are rejected immediately. The slot is released when the stream closes. The limit applies per base credential — `alice` and `alice-session-tok123` share one slot pool.
 
-The limit applies per credential, not per exit node. A user with 20 streams open on 4 different exit nodes (5 each) is at their limit even though no individual node is saturated.
-
-## Why this looks natural
-
-- **Consistency**: one IP per domain per window. Cloudflare and similar see a consistent source IP making requests, not a different IP every 5 seconds.
-- **Gradual transition**: when the window expires, existing connections finish on the old IP. Only new connections go to the new IP.
-- **Cooldown**: the rotated exit node is excluded from that domain for 10 minutes — it doesn't immediately show up again on the same target, mimicking a user that moved on.
-- **Jitter**: real users don't switch IPs on exact intervals.
+---
 
 ## What the router does NOT own
 
@@ -84,25 +184,3 @@ The router controls **which IP** traffic goes through. It does not control:
 - Request pacing / think time between requests (client's responsibility)
 - HTTP headers, cookies, TLS fingerprint (client's responsibility)
 - Whether requests look human (client's responsibility)
-
-## Concurrency limit
-
-Each exit node has an `activeStreams` counter (atomic int32). Sessions at `maxStreamsPerNode` are excluded from selection. This prevents a single exit node from handling dozens of simultaneous connections, which would make one residential IP look like a datacenter.
-
-## Per-user affinity
-
-The routing key is `username:host`, not just `host`. Each SOCKS5 credential gets its own independent affinity map entry, so two users hitting the same domain are assigned different exit nodes when possible.
-
-This is implemented via `socks5.WithDialAndRequest` — the library passes the authenticated `*socks5.Request` to the dialer, and `request.AuthContext.Payload["Username"]` contains the verified username.
-
-### Behaviour when exit nodes are scarce
-
-`pickSession` picks randomly from eligible nodes (alive, under concurrency cap, not in cooldown for that domain). It has no awareness of nodes already assigned to other users for the same domain.
-
-Consequences:
-
-- **Each user is still consistent** — `user1:example.com` sticks to the same exit node for its full window, regardless of what other users are doing.
-- **No diversity guarantee** — if there are fewer exit nodes than SOCKS5 credentials, multiple users will inevitably share an exit node. There is no error; the assignment is just random.
-- **Optimal spreading is not attempted** — `pickSession` does not deprioritise nodes already assigned to another user for the same domain. With N nodes and M users (M > N), some nodes will serve multiple users.
-
-If maximising IP diversity across users is critical, the number of active exit nodes should be kept at or above the number of concurrent SOCKS5 credentials in use.

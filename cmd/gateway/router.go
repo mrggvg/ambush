@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand/v2"
 	"net"
 	"sync"
@@ -34,10 +35,27 @@ type Router struct {
 }
 
 func NewRouter(pool *Pool) *Router {
-	return &Router{
+	r := &Router{
 		pool:     pool,
 		affinity: make(map[string]*affinityEntry),
 		cooldown: make(map[string]time.Time),
+	}
+	go r.cleanupLoop()
+	return r
+}
+
+func (r *Router) cleanupLoop() {
+	ticker := time.NewTicker(cooldownDuration)
+	defer ticker.Stop()
+	for range ticker.C {
+		now := time.Now()
+		r.mu.Lock()
+		for key, exp := range r.cooldown {
+			if now.After(exp) {
+				delete(r.cooldown, key)
+			}
+		}
+		r.mu.Unlock()
 	}
 }
 
@@ -56,15 +74,16 @@ func (r *Router) DialWithUser(ctx context.Context, _, addr, username string) (ne
 		return nil, err
 	}
 
-	conn, err := r.openStream(se, addr)
+	conn, err := r.openStream(se, addr, username)
 	if err != nil {
 		// session died between selection and open — clear affinity and retry once
+		slog.Warn("stream open failed, retrying with new session", "exitnode_id", se.id, "addr", addr, "error", err)
 		r.clearAffinity(affinityKey)
 		se, err = r.assignSession(affinityKey, host)
 		if err != nil {
 			return nil, err
 		}
-		return r.openStream(se, addr)
+		return r.openStream(se, addr, username)
 	}
 	return conn, nil
 }
@@ -130,7 +149,7 @@ func (r *Router) pickSession(domain string) *sessionEntry {
 	return eligible[rand.IntN(len(eligible))]
 }
 
-func (r *Router) openStream(se *sessionEntry, addr string) (net.Conn, error) {
+func (r *Router) openStream(se *sessionEntry, addr, username string) (net.Conn, error) {
 	stream, err := se.session.Open()
 	if err != nil {
 		return nil, err
@@ -141,6 +160,7 @@ func (r *Router) openStream(se *sessionEntry, addr string) (net.Conn, error) {
 	}
 	se.activeStreams.Add(1)
 	r.pool.streams.Add(1)
+	slog.Info("stream opened", "exitnode_id", se.id, "addr", addr, "username", username)
 	return &trackedConn{Conn: stream, entry: se, pool: r.pool}, nil
 }
 

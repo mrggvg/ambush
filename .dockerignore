@@ -1,0 +1,25 @@
+# build outputs
+/gateway
+/exitnode
+/api
+/gencerts
+
+# docs and tooling
+docs/
+bruno/
+scripts/
+test/
+.github/
+
+# local config
+cmd/gateway/.env
+cmd/api/.env
+cmd/exitnode/exitnode.json
+
+# certs (never bake into image)
+*.crt
+*.key
+
+# misc
+.git/
+*.md

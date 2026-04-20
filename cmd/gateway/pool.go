@@ -1,7 +1,7 @@
 package main
 
 import (
-	"log"
+	"log/slog"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -35,7 +35,7 @@ func (p *Pool) add(e *sessionEntry) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.entries = append(p.entries, e)
-	log.Printf("pool: exitnode added (%d total)", len(p.entries))
+	slog.Info("pool: exitnode added", "exitnode_id", e.id, "total", len(p.entries))
 }
 
 func (p *Pool) remove(e *sessionEntry) {
@@ -47,7 +47,7 @@ func (p *Pool) remove(e *sessionEntry) {
 			break
 		}
 	}
-	log.Printf("pool: exitnode removed (%d total)", len(p.entries))
+	slog.Info("pool: exitnode removed", "exitnode_id", e.id, "total", len(p.entries))
 }
 
 func (p *Pool) closeAll() {
@@ -64,7 +64,7 @@ func (p *Pool) waitStreams(timeout time.Duration) {
 	select {
 	case <-done:
 	case <-time.After(timeout):
-		log.Println("shutdown: timed out waiting for active streams")
+		slog.Warn("shutdown: timed out waiting for active streams")
 	}
 }
 

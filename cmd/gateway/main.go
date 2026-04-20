@@ -5,7 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -22,6 +22,7 @@ import (
 const (
 	pingInterval = 30 * time.Second
 	pongTimeout  = 10 * time.Second
+	dbTimeout    = 5 * time.Second
 )
 
 var upgrader = websocket.Upgrader{
@@ -33,8 +34,10 @@ type dbCredentialStore struct {
 }
 
 func (s *dbCredentialStore) Valid(user, password, _ string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
+	defer cancel()
 	var ok bool
-	err := s.db.QueryRow(context.Background(),
+	err := s.db.QueryRow(ctx,
 		`SELECT EXISTS(
 			SELECT 1 FROM proxy_credentials
 			WHERE username = $1
@@ -43,13 +46,15 @@ func (s *dbCredentialStore) Valid(user, password, _ string) bool {
 		)`, user, password,
 	).Scan(&ok)
 	if err != nil {
-		log.Printf("socks5 auth db error: %v", err)
+		slog.Error("socks5 auth failed", "username", user, "error", err)
 		return false
 	}
 	return ok
 }
 
 func validateExitNodeToken(ctx context.Context, db *pgxpool.Pool, token string) string {
+	ctx, cancel := context.WithTimeout(ctx, dbTimeout)
+	defer cancel()
 	hash := sha256Hex(token)
 	var id string
 	err := db.QueryRow(ctx,
@@ -60,16 +65,18 @@ func validateExitNodeToken(ctx context.Context, db *pgxpool.Pool, token string) 
 		hash,
 	).Scan(&id)
 	if err != nil {
-		log.Printf("token auth db error: %v", err)
+		slog.Error("token auth failed", "error", err)
 		return ""
 	}
 	return id
 }
 
 func trackExitNodeIP(ctx context.Context, db *pgxpool.Pool, tokenID, remoteAddr string) {
+	ctx, cancel := context.WithTimeout(ctx, dbTimeout)
+	defer cancel()
 	ip, _, err := net.SplitHostPort(remoteAddr)
 	if err != nil {
-		log.Printf("ip tracking: failed to parse addr %s: %v", remoteAddr, err)
+		slog.Error("ip tracking: parse addr failed", "addr", remoteAddr, "error", err)
 		return
 	}
 	_, err = db.Exec(ctx,
@@ -79,7 +86,7 @@ func trackExitNodeIP(ctx context.Context, db *pgxpool.Pool, tokenID, remoteAddr 
 		tokenID, ip,
 	)
 	if err != nil {
-		log.Printf("ip tracking: upsert failed: %v", err)
+		slog.Error("ip tracking: upsert failed", "token_id", tokenID, "ip", ip, "error", err)
 	}
 }
 
@@ -94,16 +101,20 @@ func sha256Hex(s string) string {
 }
 
 func main() {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+
 	db, err := pgxpool.New(context.Background(), os.Getenv("DATABASE_URL"))
 	if err != nil {
-		log.Fatalf("db connect failed: %v", err)
+		slog.Error("db connect failed", "error", err)
+		os.Exit(1)
 	}
 	defer db.Close()
 
 	if err := db.Ping(context.Background()); err != nil {
-		log.Fatalf("db ping failed: %v", err)
+		slog.Error("db ping failed", "error", err)
+		os.Exit(1)
 	}
-	log.Println("connected to database")
+	slog.Info("connected to database")
 
 	pool := &Pool{}
 	router := NewRouter(pool)
@@ -132,7 +143,7 @@ func main() {
 
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
-			log.Printf("upgrade failed: %v", err)
+			slog.Error("websocket upgrade failed", "remote_addr", r.RemoteAddr, "error", err)
 			return
 		}
 
@@ -144,7 +155,7 @@ func main() {
 		wsc := &wsConn{conn: conn}
 		session, err := yamux.Server(wsc, nil)
 		if err != nil {
-			log.Printf("yamux failed: %v", err)
+			slog.Error("yamux session failed", "remote_addr", r.RemoteAddr, "error", err)
 			_ = conn.Close()
 			return
 		}
@@ -166,9 +177,10 @@ func main() {
 		}()
 
 		entry := newSessionEntry(session)
-		log.Printf("exitnode connected from %s", r.RemoteAddr)
+		slog.Info("exitnode connected", "exitnode_id", entry.id, "remote_addr", r.RemoteAddr, "token_id", tokenID)
 		pool.add(entry)
 		defer func() {
+			slog.Info("exitnode disconnected", "exitnode_id", entry.id, "remote_addr", r.RemoteAddr)
 			pool.remove(entry)
 			_ = session.Close()
 		}()
@@ -182,7 +194,8 @@ func main() {
 	}
 	socks5Ln, err := net.Listen("tcp", socks5Addr)
 	if err != nil {
-		log.Fatalf("socks5 listen failed: %v", err)
+		slog.Error("socks5 listen failed", "error", err)
+		os.Exit(1)
 	}
 
 	proxy := socks5.NewServer(
@@ -196,9 +209,9 @@ func main() {
 		}),
 	)
 	go func() {
-		log.Printf("SOCKS5 listening on %s", socks5Addr)
+		slog.Info("SOCKS5 listening", "addr", socks5Addr)
 		if err := proxy.Serve(socks5Ln); err != nil {
-			log.Printf("SOCKS5 stopped: %v", err)
+			slog.Error("SOCKS5 stopped", "error", err)
 		}
 	}()
 
@@ -212,16 +225,16 @@ func main() {
 		certFile := os.Getenv("TLS_CERT")
 		keyFile := os.Getenv("TLS_KEY")
 		if certFile != "" && keyFile != "" {
-			log.Printf("gateway listening on %s (TLS)", gatewayAddr)
-			log.Printf("health endpoint: https://%s/health", gatewayAddr)
+			slog.Info("gateway listening", "addr", gatewayAddr, "tls", true)
 			if err := httpServer.ListenAndServeTLS(certFile, keyFile); err != nil && err != http.ErrServerClosed {
-				log.Fatalf("gateway stopped: %v", err)
+				slog.Error("gateway stopped", "error", err)
+				os.Exit(1)
 			}
 		} else {
-			log.Printf("gateway listening on %s", gatewayAddr)
-			log.Printf("health endpoint: http://%s/health", gatewayAddr)
+			slog.Info("gateway listening", "addr", gatewayAddr, "tls", false)
 			if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				log.Fatalf("gateway stopped: %v", err)
+				slog.Error("gateway stopped", "error", err)
+				os.Exit(1)
 			}
 		}
 	}()
@@ -230,16 +243,16 @@ func main() {
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
 	<-quit
 
-	log.Println("shutting down — draining active streams...")
+	slog.Info("shutting down — draining active streams")
 	_ = socks5Ln.Close()
 	pool.waitStreams(30 * time.Second)
 
-	log.Println("closing exitnode sessions...")
+	slog.Info("closing exitnode sessions")
 	pool.closeAll()
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = httpServer.Shutdown(shutdownCtx)
 
-	log.Println("shutdown complete")
+	slog.Info("shutdown complete")
 }

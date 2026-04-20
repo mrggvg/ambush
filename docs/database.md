@@ -9,7 +9,6 @@ erDiagram
     users {
         uuid id PK
         text display_name
-        bigint telegram_id "nullable"
         timestamptz created_at
         boolean is_active
     }
@@ -43,7 +42,7 @@ erDiagram
 ## Tables
 
 ### `users`
-Identity record for anyone who can run an exit node. The `telegram_id` column is nullable — the same table supports users registered via Telegram bot, webapp, or created directly by admin.
+Identity record for anyone who can run an exit node.
 
 ### `exit_node_tokens`
 Bearer tokens that exit nodes use to authenticate with the gateway. One token = one exit node instance (enforced by the `UNIQUE(user_id, label)` constraint).

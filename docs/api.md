@@ -21,11 +21,9 @@ Create a new user.
 **Body:**
 ```json
 {
-  "display_name": "John Doe",
-  "telegram_id": 123456789
+  "display_name": "John Doe"
 }
 ```
-`telegram_id` is optional.
 
 **Response:**
 ```json
@@ -47,7 +45,6 @@ List all users ordered by creation date.
   {
     "id": "uuid",
     "display_name": "John Doe",
-    "telegram_id": 123456789,
     "created_at": "2026-04-20T10:00:00Z",
     "is_active": true
   }

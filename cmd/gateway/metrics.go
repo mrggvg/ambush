@@ -12,10 +12,10 @@ import (
 // All methods are nil-safe — pass nil to disable metrics without branching at call sites.
 type Metrics struct {
 	exitnodesActive   prometheus.Gauge
-	streamsActive     prometheus.Gauge
+	streamsActive     *prometheus.GaugeVec   // label: exitnode_id
 	dialsTotal        *prometheus.CounterVec // label: result
 	rotationsTotal    *prometheus.CounterVec // label: reason
-	streamErrorsTotal prometheus.Counter
+	streamErrorsTotal *prometheus.CounterVec // label: exitnode_id
 	credLimitExceeded prometheus.Counter
 }
 
@@ -27,10 +27,10 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "ambush_exitnodes_active",
 			Help: "Number of exit nodes currently connected.",
 		}),
-		streamsActive: f.NewGauge(prometheus.GaugeOpts{
+		streamsActive: f.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "ambush_streams_active",
-			Help: "Number of proxy streams currently open.",
-		}),
+			Help: "Number of proxy streams currently open, by exit node.",
+		}, []string{"exitnode_id"}),
 		dialsTotal: f.NewCounterVec(prometheus.CounterOpts{
 			Name: "ambush_dials_total",
 			Help: "Total dial attempts by result (success | no_exitnodes | stream_error | rate_limited).",
@@ -39,10 +39,10 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "ambush_rotations_total",
 			Help: "Total affinity rotation events by reason (budget | expiry | session_closed | concurrency).",
 		}, []string{"reason"}),
-		streamErrorsTotal: f.NewCounter(prometheus.CounterOpts{
+		streamErrorsTotal: f.NewCounterVec(prometheus.CounterOpts{
 			Name: "ambush_stream_errors_total",
-			Help: "Total stream open failures (yamux session died between selection and open).",
-		}),
+			Help: "Total stream open failures (yamux session died between selection and open), by exit node.",
+		}, []string{"exitnode_id"}),
 		credLimitExceeded: f.NewCounter(prometheus.CounterOpts{
 			Name: "ambush_credential_limit_exceeded_total",
 			Help: "Total times a credential hit its concurrent stream limit.",
@@ -57,11 +57,12 @@ func MetricsHandler(reg *prometheus.Registry) http.Handler {
 
 // nil-safe instrumentation — all methods are no-ops when m is nil.
 
-func (m *Metrics) incExitnodes()              { if m != nil { m.exitnodesActive.Inc() } }
-func (m *Metrics) decExitnodes()              { if m != nil { m.exitnodesActive.Dec() } }
-func (m *Metrics) incStreams()                { if m != nil { m.streamsActive.Inc() } }
-func (m *Metrics) decStreams()                { if m != nil { m.streamsActive.Dec() } }
-func (m *Metrics) incStreamErrors()           { if m != nil { m.streamErrorsTotal.Inc() } }
-func (m *Metrics) incCredLimitExceeded()      { if m != nil { m.credLimitExceeded.Inc() } }
-func (m *Metrics) incDials(result string)     { if m != nil { m.dialsTotal.WithLabelValues(result).Inc() } }
-func (m *Metrics) incRotations(reason string) { if m != nil { m.rotationsTotal.WithLabelValues(reason).Inc() } }
+func (m *Metrics) incExitnodes()                        { if m != nil { m.exitnodesActive.Inc() } }
+func (m *Metrics) decExitnodes()                        { if m != nil { m.exitnodesActive.Dec() } }
+func (m *Metrics) incStreams(id string)                 { if m != nil { m.streamsActive.WithLabelValues(id).Inc() } }
+func (m *Metrics) decStreams(id string)                 { if m != nil { m.streamsActive.WithLabelValues(id).Dec() } }
+func (m *Metrics) deleteExitnodeStreams(id string)      { if m != nil { m.streamsActive.DeleteLabelValues(id) } }
+func (m *Metrics) incStreamErrors(id string)            { if m != nil { m.streamErrorsTotal.WithLabelValues(id).Inc() } }
+func (m *Metrics) incCredLimitExceeded()                { if m != nil { m.credLimitExceeded.Inc() } }
+func (m *Metrics) incDials(result string)               { if m != nil { m.dialsTotal.WithLabelValues(result).Inc() } }
+func (m *Metrics) incRotations(reason string)           { if m != nil { m.rotationsTotal.WithLabelValues(reason).Inc() } }

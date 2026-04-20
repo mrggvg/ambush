@@ -64,7 +64,20 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-func TestE2ETrafficFlowsThroughExitNode(t *testing.T) {
+// testEnv holds all running infrastructure for an E2E test.
+type testEnv struct {
+	healthURL string
+	echoAddr  string
+	client    *http.Client // SOCKS5-backed HTTP client
+	gwPort    int
+	caCertPEM []byte
+}
+
+// setupTestEnv starts Postgres, the gateway, and one exit node. All processes
+// are registered for cleanup via t.Cleanup. The exit node process is returned
+// separately so tests can kill and restart it.
+func setupTestEnv(t *testing.T) (*testEnv, *exec.Cmd) {
+	t.Helper()
 	ctx := context.Background()
 
 	// --- Postgres container ---
@@ -94,7 +107,6 @@ func TestE2ETrafficFlowsThroughExitNode(t *testing.T) {
 	}
 	dbURL := fmt.Sprintf("postgresql://ambush:ambush@localhost:%s/ambush_test?sslmode=disable", port.Port())
 
-	// --- Apply schema and seed ---
 	pool, err := pgxpool.New(ctx, dbURL)
 	if err != nil {
 		t.Fatalf("connect to test db: %v", err)
@@ -104,9 +116,8 @@ func TestE2ETrafficFlowsThroughExitNode(t *testing.T) {
 	applySchema(t, ctx, pool)
 	seedTestData(t, ctx, pool)
 
-	// --- Generate TLS certs ---
+	// --- TLS certs ---
 	caCertPEM, gwCertPEM, gwKeyPEM := genTestCerts(t)
-
 	certFile := filepath.Join(t.TempDir(), "gateway.crt")
 	keyFile := filepath.Join(t.TempDir(), "gateway.key")
 	if err := os.WriteFile(certFile, gwCertPEM, 0644); err != nil {
@@ -120,7 +131,7 @@ func TestE2ETrafficFlowsThroughExitNode(t *testing.T) {
 	gwPort := freePort(t)
 	socksPort := freePort(t)
 
-	// --- Start gateway with TLS ---
+	// --- Start gateway ---
 	gwCmd := exec.Command(gatewayBin)
 	gwCmd.Env = append(os.Environ(),
 		"DATABASE_URL="+dbURL,
@@ -136,27 +147,14 @@ func TestE2ETrafficFlowsThroughExitNode(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = gwCmd.Process.Kill() })
 
-	// --- Start exitnode over wss:// ---
-	enCmd := exec.Command(exitnodeBin)
-	enCmd.Env = append(os.Environ(),
-		fmt.Sprintf("AMBUSH_GATEWAY_URL=wss://127.0.0.1:%d", gwPort),
-		"AMBUSH_TOKEN="+testToken,
-		"AMBUSH_CA_CERT="+string(caCertPEM),
-	)
-	enCmd.Stdout = os.Stderr
-	enCmd.Stderr = os.Stderr
-	if err := enCmd.Start(); err != nil {
-		t.Fatalf("start exitnode: %v", err)
-	}
-	t.Cleanup(func() { _ = enCmd.Process.Kill() })
-
-	// --- Wait until exit node is in the pool ---
-	// Health endpoint is now HTTPS; use an insecure client just for polling.
 	healthURL := fmt.Sprintf("https://127.0.0.1:%d/health", gwPort)
-	waitForExitNode(t, healthURL, 30*time.Second)
 
-	// --- Local echo target server ---
-	// The exit node dials this directly — no external internet dependency.
+	// --- Start exit node ---
+	enCmd := startExitNode(t, gwPort, caCertPEM)
+
+	waitForPoolSize(t, healthURL, 1, 30*time.Second)
+
+	// --- Local echo server (exit node dials this directly) ---
 	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("echo listener: %v", err)
@@ -170,7 +168,7 @@ func TestE2ETrafficFlowsThroughExitNode(t *testing.T) {
 	go func() { _ = echoSrv.Serve(echoLn) }()
 	t.Cleanup(func() { _ = echoSrv.Close() })
 
-	// --- Route a request through the SOCKS5 proxy ---
+	// --- SOCKS5-backed HTTP client ---
 	dialer, err := proxy.SOCKS5("tcp",
 		fmt.Sprintf("127.0.0.1:%d", socksPort),
 		&proxy.Auth{User: testSocksUser, Password: testSocksPass},
@@ -179,7 +177,6 @@ func TestE2ETrafficFlowsThroughExitNode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create socks5 dialer: %v", err)
 	}
-
 	client := &http.Client{
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -189,20 +186,122 @@ func TestE2ETrafficFlowsThroughExitNode(t *testing.T) {
 		Timeout: 15 * time.Second,
 	}
 
-	resp, err := client.Get("http://" + echoAddr)
+	return &testEnv{
+		healthURL: healthURL,
+		echoAddr:  echoAddr,
+		client:    client,
+		gwPort:    gwPort,
+		caCertPEM: caCertPEM,
+	}, enCmd
+}
+
+// proxyGet makes an HTTP GET through the SOCKS5 proxy and asserts the response body.
+func (e *testEnv) proxyGet(t *testing.T) {
+	t.Helper()
+	resp, err := e.client.Get("http://" + e.echoAddr)
 	if err != nil {
 		t.Fatalf("socks5 request failed: %v", err)
 	}
 	defer resp.Body.Close()
-
 	body, _ := io.ReadAll(resp.Body)
 	if string(body) != "ambush-e2e-ok" {
 		t.Fatalf("unexpected response body: %q", string(body))
 	}
+}
+
+// --- Tests ---
+
+func TestE2ETrafficFlowsThroughExitNode(t *testing.T) {
+	env, _ := setupTestEnv(t)
+	env.proxyGet(t)
 	t.Log("traffic flowed through gateway (TLS) → exit node → echo server")
 }
 
+// TestE2EMultipleSequentialRequests verifies that N back-to-back requests
+// through the same exit node all succeed. This exercises affinity persistence
+// and the stream-open/close cycle under repeated use.
+func TestE2EMultipleSequentialRequests(t *testing.T) {
+	env, _ := setupTestEnv(t)
+	for i := range 5 {
+		env.proxyGet(t)
+		t.Logf("request %d/5 ok", i+1)
+	}
+}
+
+// TestE2EExitNodeReconnect verifies that after an exit node disconnects and
+// reconnects (same public IP), requests succeed immediately without hitting a
+// domain cooldown. This is a regression test for the bug where session_closed
+// rotation incorrectly put the node's IP in a 10-minute domain cooldown.
+func TestE2EExitNodeReconnect(t *testing.T) {
+	env, enCmd := setupTestEnv(t)
+
+	// Baseline: first request must succeed to establish affinity.
+	env.proxyGet(t)
+	t.Log("pre-reconnect request ok")
+
+	// Kill the exit node to simulate a crash.
+	if err := enCmd.Process.Kill(); err != nil {
+		t.Fatalf("kill exit node: %v", err)
+	}
+	waitForPoolSize(t, env.healthURL, 0, 15*time.Second)
+	t.Log("exit node disconnected, pool at 0")
+
+	// Restart the exit node (same IP — reconnect from same machine).
+	startExitNode(t, env.gwPort, env.caCertPEM)
+	waitForPoolSize(t, env.healthURL, 1, 30*time.Second)
+	t.Log("exit node reconnected, pool at 1")
+
+	// Must succeed: the reconnected node should NOT be blocked by domain cooldown.
+	env.proxyGet(t)
+	t.Log("post-reconnect request ok — cooldown correctly skipped for session_closed rotation")
+}
+
 // --- Helpers ---
+
+func startExitNode(t *testing.T, gwPort int, caCertPEM []byte) *exec.Cmd {
+	t.Helper()
+	cmd := exec.Command(exitnodeBin)
+	cmd.Env = append(os.Environ(),
+		fmt.Sprintf("AMBUSH_GATEWAY_URL=wss://127.0.0.1:%d", gwPort),
+		"AMBUSH_TOKEN="+testToken,
+		"AMBUSH_CA_CERT="+string(caCertPEM),
+	)
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start exit node: %v", err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+	return cmd
+}
+
+// waitForPoolSize polls the health endpoint until the pool reaches exactly n
+// exit nodes, or the timeout elapses.
+func waitForPoolSize(t *testing.T, healthURL string, n int, timeout time.Duration) {
+	t.Helper()
+	insecure := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+		},
+		Timeout: 3 * time.Second,
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		resp, err := insecure.Get(healthURL)
+		if err == nil {
+			var h struct {
+				ExitNodes int `json:"exitnodes"`
+			}
+			_ = json.NewDecoder(resp.Body).Decode(&h)
+			_ = resp.Body.Close()
+			if h.ExitNodes == n {
+				return
+			}
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for pool size %d at %s", n, healthURL)
+}
 
 // genTestCerts generates an in-memory CA and gateway cert for testing.
 // Returns (caCertPEM, gatewayCertPEM, gatewayKeyPEM).
@@ -294,32 +393,10 @@ func seedTestData(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
 	}
 }
 
-// waitForExitNode polls the health endpoint (HTTPS, insecure client) until
-// at least one exit node is registered in the pool.
+// waitForExitNode is kept for backward compatibility; use waitForPoolSize directly.
 func waitForExitNode(t *testing.T, healthURL string, timeout time.Duration) {
 	t.Helper()
-	insecure := &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
-		},
-		Timeout: 3 * time.Second,
-	}
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		resp, err := insecure.Get(healthURL)
-		if err == nil {
-			var h struct {
-				ExitNodes int `json:"exitnodes"`
-			}
-			_ = json.NewDecoder(resp.Body).Decode(&h)
-			_ = resp.Body.Close()
-			if h.ExitNodes > 0 {
-				return
-			}
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-	t.Fatal("timed out waiting for exit node to appear in gateway pool")
+	waitForPoolSize(t, healthURL, 1, timeout)
 }
 
 func freePort(t *testing.T) int {

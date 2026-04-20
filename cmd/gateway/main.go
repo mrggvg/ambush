@@ -106,7 +106,10 @@ func sha256Hex(s string) string {
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 
-	db, err := pgxpool.New(context.Background(), os.Getenv("DATABASE_URL"))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	db, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
 	if err != nil {
 		slog.Error("db connect failed", "error", err)
 		os.Exit(1)
@@ -123,6 +126,12 @@ func main() {
 	metrics := NewMetrics(reg)
 
 	pool := &Pool{metrics: metrics}
+
+	authLimiter := newAuthRateLimiter(ctx,
+		10,             // block after 10 failures
+		time.Minute,    // within a 1-minute window
+		15*time.Minute, // block for 15 minutes
+	)
 
 	maxStreams := int32(20)
 	if v := os.Getenv("MAX_STREAMS_PER_CREDENTIAL"); v != "" {
@@ -149,11 +158,24 @@ func main() {
 	})
 
 	http.HandleFunc("/exitnode", func(w http.ResponseWriter, r *http.Request) {
+		remoteIP, _, _ := net.SplitHostPort(r.RemoteAddr)
+
+		if !authLimiter.allow(remoteIP) {
+			slog.Warn("exitnode auth blocked — rate limit active", "ip", remoteIP)
+			http.Error(w, "too many requests", http.StatusTooManyRequests)
+			return
+		}
+
 		tokenID := validateExitNodeToken(r.Context(), db, r.URL.Query().Get("token"))
 		if tokenID == "" {
+			authLimiter.recordFailure(remoteIP)
+			if authLimiter.blocked(remoteIP) {
+				slog.Warn("exitnode auth rate limit triggered", "ip", remoteIP)
+			}
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
+		authLimiter.recordSuccess(remoteIP)
 
 		trackExitNodeIP(r.Context(), db, tokenID, r.RemoteAddr)
 
@@ -192,16 +214,15 @@ func main() {
 			}
 		}()
 
-		exitIP, _, _ := net.SplitHostPort(r.RemoteAddr)
-		entry := newSessionEntry(session, exitIP)
-		slog.Info("exitnode connected", "exitnode_id", entry.id, "ip", exitIP, "token_id", tokenID)
+		entry := newSessionEntry(session, remoteIP)
+		slog.Info("exitnode connected", "exitnode_id", entry.id, "ip", remoteIP, "token_id", tokenID)
 		pool.add(entry)
-		if peers := pool.byIP(exitIP); len(peers) > 1 {
+		if peers := pool.byIP(remoteIP); len(peers) > 1 {
 			slog.Warn("multiple exit nodes share the same public IP — they will share cooldown slots per domain",
-				"ip", exitIP, "count", len(peers))
+				"ip", remoteIP, "count", len(peers))
 		}
 		defer func() {
-			slog.Info("exitnode disconnected", "exitnode_id", entry.id, "ip", exitIP)
+			slog.Info("exitnode disconnected", "exitnode_id", entry.id, "ip", remoteIP)
 			pool.remove(entry)
 			_ = session.Close()
 		}()
@@ -226,6 +247,7 @@ func main() {
 			if req.AuthContext != nil {
 				username = req.AuthContext.Payload["Username"]
 			}
+			ctx = withRequestID(ctx, newRequestID())
 			return router.DialWithUser(ctx, network, addr, username)
 		}),
 	)
@@ -262,6 +284,7 @@ func main() {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
 	<-quit
+	cancel()
 
 	slog.Info("shutting down — draining active streams")
 	_ = socks5Ln.Close()

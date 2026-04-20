@@ -3,6 +3,7 @@ package main
 import (
 	"log/slog"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,6 +18,7 @@ type sessionEntry struct {
 	ip           string // public IP of the exit node as seen by the gateway
 	session      *yamux.Session
 	activeStreams atomic.Int32
+	health       nodeHealth
 }
 
 func newSessionEntry(s *yamux.Session, ip string) *sessionEntry {
@@ -53,6 +55,7 @@ func (p *Pool) remove(e *sessionEntry) {
 	}
 	slog.Info("pool: exitnode removed", "exitnode_id", e.id, "total", len(p.entries))
 	p.metrics.decExitnodes()
+	p.metrics.deleteExitnodeStreams(strconv.FormatUint(e.id, 10))
 }
 
 func (p *Pool) closeAll() {
@@ -112,7 +115,7 @@ func (c *trackedConn) Close() error {
 	c.once.Do(func() {
 		c.entry.activeStreams.Add(-1)
 		c.pool.streams.Done()
-		c.metrics.decStreams()
+		c.metrics.decStreams(strconv.FormatUint(c.entry.id, 10))
 	})
 	return c.Conn.Close()
 }

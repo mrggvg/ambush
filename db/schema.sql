@@ -1,10 +1,8 @@
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
--- Users can be created via any channel (Telegram bot, webapp, admin, etc.)
 CREATE TABLE users (
     id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
     display_name TEXT       NOT NULL,
-    telegram_id  BIGINT     UNIQUE,                          -- nullable, set when user registers via Telegram
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     is_active   BOOLEAN     NOT NULL DEFAULT true
 );

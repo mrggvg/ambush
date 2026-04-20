@@ -113,10 +113,10 @@ The gateway exposes Prometheus metrics at `GET /metrics` (same port as the WebSo
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `ambush_exitnodes_active` | Gauge | — | Connected exit nodes |
-| `ambush_streams_active` | Gauge | — | Currently open proxy streams |
+| `ambush_streams_active` | GaugeVec | `exitnode_id` | Currently open proxy streams, per exit node |
 | `ambush_dials_total` | Counter | `result` | Dial attempts — `success`, `error`, `rate_limited` |
 | `ambush_rotations_total` | Counter | `reason` | Affinity rotations — `budget`, `expiry`, `session_closed`, `concurrency` |
-| `ambush_stream_errors_total` | Counter | — | `yamux.Open()` failures (session died mid-routing) |
+| `ambush_stream_errors_total` | CounterVec | `exitnode_id` | `yamux.Open()` failures per exit node (session died mid-routing) |
 | `ambush_credential_limit_exceeded_total` | Counter | — | Credentials that hit `MAX_STREAMS_PER_CREDENTIAL` |
 
 Minimal Prometheus scrape config:

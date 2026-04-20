@@ -1,4 +1,4 @@
-name: E2E
+name: CI
 
 on:
   push:
@@ -7,8 +7,27 @@ on:
     branches: [main]
 
 jobs:
-  e2e:
+  unit:
+    name: Unit tests
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Unit tests (race detector)
+        run: go test ./cmd/... -race -count=1 -timeout 60s
+
+  e2e:
+    name: E2E tests
+    runs-on: ubuntu-latest
+    needs: unit
 
     steps:
       - uses: actions/checkout@v4
@@ -18,5 +37,5 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Run E2E tests
-        run: go test ./test/e2e/... -v -timeout 120s
+      - name: E2E tests
+        run: go test ./test/e2e/... -v -timeout 180s

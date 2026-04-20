@@ -317,6 +317,52 @@ func TestAssignSession_SetsCooldownOnRotation(t *testing.T) {
 	}
 }
 
+func TestAssignSession_NoCooldownOnSessionClosed(t *testing.T) {
+	// When the affinity entry's session dies, the node should NOT be put in
+	// cooldown — it may reconnect with the same IP and should be usable immediately.
+	p, servers := poolWithSessions(t, 2)
+	serveStreams(servers[0])
+	serveStreams(servers[1])
+	r := newTestRouter(p)
+
+	se1, _ := r.assignSession("alice:example.com", "example.com")
+	// kill the session so isAffinityValid returns false with reason session_closed
+	se1.session.Close()
+
+	r.assignSession("alice:example.com", "example.com")
+
+	r.mu.Lock()
+	_, ok := r.cooldown[se1.ip+":example.com"]
+	r.mu.Unlock()
+
+	if ok {
+		t.Fatal("session_closed rotation must not set domain cooldown")
+	}
+}
+
+func TestAssignSession_NoCooldownOnConcurrency(t *testing.T) {
+	// A node that hit its concurrency cap should not be cooled down —
+	// it may free up capacity immediately and should be reusable.
+	p, servers := poolWithSessions(t, 2)
+	serveStreams(servers[0])
+	serveStreams(servers[1])
+	r := newTestRouter(p)
+
+	se1, _ := r.assignSession("alice:example.com", "example.com")
+	// simulate concurrency limit hit on the assigned node
+	se1.activeStreams.Store(maxStreamsPerNode)
+
+	r.assignSession("alice:example.com", "example.com")
+
+	r.mu.Lock()
+	_, ok := r.cooldown[se1.ip+":example.com"]
+	r.mu.Unlock()
+
+	if ok {
+		t.Fatal("concurrency rotation must not set domain cooldown")
+	}
+}
+
 func TestAssignSession_NoSessionsAvailable(t *testing.T) {
 	r := newTestRouter(&Pool{})
 	_, err := r.assignSession("alice:example.com", "example.com")

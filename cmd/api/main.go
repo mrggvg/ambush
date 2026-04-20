@@ -80,7 +80,6 @@ func bearerAuth(token string) func(http.Handler) http.Handler {
 func (s *Server) createUser(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		DisplayName string `json:"display_name"`
-		TelegramID  *int64 `json:"telegram_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.DisplayName == "" {
 		http.Error(w, "display_name required", http.StatusBadRequest)
@@ -89,8 +88,8 @@ func (s *Server) createUser(w http.ResponseWriter, r *http.Request) {
 
 	var id string
 	err := s.db.QueryRow(r.Context(),
-		`INSERT INTO users (display_name, telegram_id) VALUES ($1, $2) RETURNING id`,
-		body.DisplayName, body.TelegramID,
+		`INSERT INTO users (display_name) VALUES ($1) RETURNING id`,
+		body.DisplayName,
 	).Scan(&id)
 	if err != nil {
 		http.Error(w, "failed to create user", http.StatusInternalServerError)
@@ -103,7 +102,7 @@ func (s *Server) createUser(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) listUsers(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.db.Query(r.Context(),
-		`SELECT id, display_name, telegram_id, created_at, is_active FROM users ORDER BY created_at DESC`,
+		`SELECT id, display_name, created_at, is_active FROM users ORDER BY created_at DESC`,
 	)
 	if err != nil {
 		http.Error(w, "failed to list users", http.StatusInternalServerError)
@@ -114,14 +113,13 @@ func (s *Server) listUsers(w http.ResponseWriter, r *http.Request) {
 	var users []map[string]any
 	for rows.Next() {
 		var id, displayName string
-		var telegramID *int64
 		var createdAt, isActive any
-		if err := rows.Scan(&id, &displayName, &telegramID, &createdAt, &isActive); err != nil {
+		if err := rows.Scan(&id, &displayName, &createdAt, &isActive); err != nil {
 			continue
 		}
 		users = append(users, map[string]any{
 			"id": id, "display_name": displayName,
-			"telegram_id": telegramID, "created_at": createdAt, "is_active": isActive,
+			"created_at": createdAt, "is_active": isActive,
 		})
 	}
 	jsonOK(w, users)

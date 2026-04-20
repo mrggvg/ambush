@@ -285,10 +285,10 @@ curl https://your-gateway:8080/health
 | Metric | Type | Description |
 |--------|------|-------------|
 | `ambush_exitnodes_active` | Gauge | Connected exit nodes |
-| `ambush_streams_active` | Gauge | Currently open proxy streams |
+| `ambush_streams_active{exitnode_id}` | GaugeVec | Currently open proxy streams, per exit node |
 | `ambush_dials_total{result}` | Counter | Dial attempts — `success`, `error`, `rate_limited` |
 | `ambush_rotations_total{reason}` | Counter | Affinity rotations — `budget`, `expiry`, `session_closed`, `concurrency` |
-| `ambush_stream_errors_total` | Counter | Stream open failures (session died mid-routing) |
+| `ambush_stream_errors_total{exitnode_id}` | CounterVec | Stream open failures per exit node (session died mid-routing) |
 | `ambush_credential_limit_exceeded_total` | Counter | Credentials that hit their concurrent stream cap |
 
 Scrape config:

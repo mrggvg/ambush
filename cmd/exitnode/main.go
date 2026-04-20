@@ -256,23 +256,30 @@ func handleStream(stream net.Conn) {
 	_ = stream.SetDeadline(time.Now().Add(idleTimeout))
 
 	br := bufio.NewReader(idleStream)
-	addr, err := br.ReadString('\n')
+	line, err := br.ReadString('\n')
 	if err != nil {
-		log.Printf("stream: failed to read addr: %v", err)
+		log.Printf("stream: failed to read header: %v", err)
 		return
 	}
-	addr = strings.TrimSpace(addr)
+	line = strings.TrimSpace(line)
+
+	// Header format: "<req_id> <addr>"
+	reqID, addr, ok := strings.Cut(line, " ")
+	if !ok {
+		log.Printf("stream: malformed header %q", line)
+		return
+	}
 
 	target, err := net.Dial("tcp", addr)
 	if err != nil {
-		log.Printf("stream: dial %s failed: %v", addr, err)
+		log.Printf("stream: req=%s dial %s failed: %v", reqID, addr, err)
 		return
 	}
 	defer func() { _ = target.Close() }()
 	idleTarget := &idleConn{Conn: target, timeout: idleTimeout}
 	_ = target.SetDeadline(time.Now().Add(idleTimeout))
 
-	log.Printf("stream: relaying to %s", addr)
+	log.Printf("stream: req=%s relaying to %s", reqID, addr)
 
 	done := make(chan struct{}, 2)
 	go func() { _, _ = io.Copy(idleTarget, br); done <- struct{}{} }()

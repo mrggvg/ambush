@@ -147,10 +147,34 @@ func connect(gatewayURL, token string) error {
 	}
 }
 
+const idleTimeout = 2 * time.Minute
+
+// idleConn resets the connection deadline on every read or write,
+// closing the connection if idle for longer than timeout.
+type idleConn struct {
+	net.Conn
+	timeout time.Duration
+}
+
+func (c *idleConn) Read(b []byte) (int, error) {
+	_ = c.Conn.SetDeadline(time.Now().Add(c.timeout))
+	return c.Conn.Read(b)
+}
+
+func (c *idleConn) Write(b []byte) (int, error) {
+	_ = c.Conn.SetDeadline(time.Now().Add(c.timeout))
+	return c.Conn.Write(b)
+}
+
 func handleStream(stream net.Conn) {
 	defer func() { _ = stream.Close() }()
 
-	br := bufio.NewReader(stream)
+	// Wrap stream before creating the bufio.Reader so deadline is reset
+	// on every underlying Read, including buffered ones.
+	idleStream := &idleConn{Conn: stream, timeout: idleTimeout}
+	_ = stream.SetDeadline(time.Now().Add(idleTimeout))
+
+	br := bufio.NewReader(idleStream)
 	addr, err := br.ReadString('\n')
 	if err != nil {
 		log.Printf("stream: failed to read addr: %v", err)
@@ -164,12 +188,14 @@ func handleStream(stream net.Conn) {
 		return
 	}
 	defer func() { _ = target.Close() }()
+	idleTarget := &idleConn{Conn: target, timeout: idleTimeout}
+	_ = target.SetDeadline(time.Now().Add(idleTimeout))
 
 	log.Printf("stream: relaying to %s", addr)
 
 	done := make(chan struct{}, 2)
-	go func() { _, _ = io.Copy(target, br); done <- struct{}{} }()
-	go func() { _, _ = io.Copy(stream, target); done <- struct{}{} }()
+	go func() { _, _ = io.Copy(idleTarget, br); done <- struct{}{} }()
+	go func() { _, _ = io.Copy(idleStream, idleTarget); done <- struct{}{} }()
 	<-done
 }
 

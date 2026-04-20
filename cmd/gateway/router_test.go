@@ -79,6 +79,7 @@ func connEntryID(conn net.Conn) uint64 {
 
 // newTestRouter constructs a Router without starting the background cleanup goroutine.
 // Uses a permissive limiter (1000 streams/credential) so router logic tests are unaffected.
+// metrics is nil — all instrumentation calls are no-ops.
 func newTestRouter(p *Pool) *Router {
 	return &Router{
 		pool:     p,

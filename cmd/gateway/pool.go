@@ -31,6 +31,7 @@ type Pool struct {
 	mu      sync.Mutex
 	entries []*sessionEntry
 	streams sync.WaitGroup
+	metrics *Metrics
 }
 
 func (p *Pool) add(e *sessionEntry) {
@@ -38,6 +39,7 @@ func (p *Pool) add(e *sessionEntry) {
 	defer p.mu.Unlock()
 	p.entries = append(p.entries, e)
 	slog.Info("pool: exitnode added", "exitnode_id", e.id, "total", len(p.entries))
+	p.metrics.incExitnodes()
 }
 
 func (p *Pool) remove(e *sessionEntry) {
@@ -50,6 +52,7 @@ func (p *Pool) remove(e *sessionEntry) {
 		}
 	}
 	slog.Info("pool: exitnode removed", "exitnode_id", e.id, "total", len(p.entries))
+	p.metrics.decExitnodes()
 }
 
 func (p *Pool) closeAll() {
@@ -99,15 +102,17 @@ func (p *Pool) snapshot() []*sessionEntry {
 // trackedConn wraps a stream and signals the pool when closed.
 type trackedConn struct {
 	net.Conn
-	once  sync.Once
-	entry *sessionEntry
-	pool  *Pool
+	once    sync.Once
+	entry   *sessionEntry
+	pool    *Pool
+	metrics *Metrics
 }
 
 func (c *trackedConn) Close() error {
 	c.once.Do(func() {
 		c.entry.activeStreams.Add(-1)
 		c.pool.streams.Done()
+		c.metrics.decStreams()
 	})
 	return c.Conn.Close()
 }

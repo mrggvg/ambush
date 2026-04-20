@@ -14,6 +14,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/gorilla/websocket"
 	"github.com/hashicorp/yamux"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -117,7 +119,10 @@ func main() {
 	}
 	slog.Info("connected to database")
 
-	pool := &Pool{}
+	reg := prometheus.NewRegistry()
+	metrics := NewMetrics(reg)
+
+	pool := &Pool{metrics: metrics}
 
 	maxStreams := int32(20)
 	if v := os.Getenv("MAX_STREAMS_PER_CREDENTIAL"); v != "" {
@@ -126,7 +131,9 @@ func main() {
 		}
 	}
 	slog.Info("credential rate limit configured", "max_streams_per_credential", maxStreams)
-	router := NewRouter(pool, NewCredentialLimiter(maxStreams))
+	router := NewRouter(pool, NewCredentialLimiter(maxStreams), metrics)
+
+	http.Handle("/metrics", MetricsHandler(reg))
 
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		entries := pool.snapshot()

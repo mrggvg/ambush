@@ -31,14 +31,16 @@ type Router struct {
 	mu       sync.Mutex
 	pool     *Pool
 	limiter  *CredentialLimiter
+	metrics  *Metrics
 	affinity map[string]*affinityEntry // domain -> active assignment
-	cooldown map[string]time.Time      // "sessionID:domain" -> expires
+	cooldown map[string]time.Time      // "ip:domain" -> expires
 }
 
-func NewRouter(pool *Pool, limiter *CredentialLimiter) *Router {
+func NewRouter(pool *Pool, limiter *CredentialLimiter, metrics *Metrics) *Router {
 	r := &Router{
 		pool:     pool,
 		limiter:  limiter,
+		metrics:  metrics,
 		affinity: make(map[string]*affinityEntry),
 		cooldown: make(map[string]time.Time),
 	}
@@ -67,14 +69,18 @@ func (r *Router) DialWithUser(ctx context.Context, _, addr, username string) (ne
 	release, err := r.limiter.Acquire(username)
 	if err != nil {
 		slog.Warn("credential rate limit exceeded", "username", username, "active_streams", r.limiter.ActiveStreams(username))
+		r.metrics.incCredLimitExceeded()
+		r.metrics.incDials("rate_limited")
 		return nil, err
 	}
 
 	conn, err := r.dial(ctx, addr, username)
 	if err != nil {
+		r.metrics.incDials("error")
 		release()
 		return nil, err
 	}
+	r.metrics.incDials("success")
 	return &rateLimitedConn{Conn: conn, release: release}, nil
 }
 
@@ -94,13 +100,19 @@ func (r *Router) dial(ctx context.Context, addr, username string) (net.Conn, err
 	conn, err := r.openStream(se, addr, username)
 	if err != nil {
 		// session died between selection and open — clear affinity and retry once
+		r.metrics.incStreamErrors()
 		slog.Warn("stream open failed, retrying with new session", "exitnode_id", se.id, "addr", addr, "error", err)
 		r.clearAffinity(affinityKey)
 		se, err = r.assignSession(affinityKey, host)
 		if err != nil {
 			return nil, err
 		}
-		return r.openStream(se, addr, username)
+		conn, err = r.openStream(se, addr, username)
+		if err != nil {
+			r.metrics.incStreamErrors()
+			return nil, err
+		}
+		return conn, nil
 	}
 	return conn, nil
 }
@@ -121,6 +133,7 @@ func (r *Router) assignSession(affinityKey, domain string) (*sessionEntry, error
 			return aff.entry, nil
 		}
 		// budget exhausted or session died — rotate
+		r.metrics.incRotations(r.rotationReason(aff))
 		r.setCooldown(aff.entry, domain)
 		delete(r.affinity, affinityKey)
 	}
@@ -180,12 +193,29 @@ func (r *Router) openStream(se *sessionEntry, addr, username string) (net.Conn, 
 	}
 	se.activeStreams.Add(1)
 	r.pool.streams.Add(1)
+	r.metrics.incStreams()
 	slog.Info("stream opened", "exitnode_id", se.id, "addr", addr, "username", username)
-	return &trackedConn{Conn: stream, entry: se, pool: r.pool}, nil
+	return &trackedConn{Conn: stream, entry: se, pool: r.pool, metrics: r.metrics}, nil
 }
 
 func (r *Router) setCooldown(se *sessionEntry, domain string) {
 	r.cooldown[se.ip+":"+domain] = time.Now().Add(cooldownDuration)
+}
+
+// rotationReason returns a Prometheus label describing why an affinity entry became invalid.
+// Conditions are checked in priority order: a closed session is the root cause even if the
+// budget is also exhausted.
+func (r *Router) rotationReason(aff *affinityEntry) string {
+	if aff.entry.session.IsClosed() {
+		return "session_closed"
+	}
+	if !time.Now().Before(aff.expiresAt) {
+		return "expiry"
+	}
+	if aff.requests >= maxRequestsPerNode {
+		return "budget"
+	}
+	return "concurrency"
 }
 
 func (r *Router) randomExpiry() time.Time {

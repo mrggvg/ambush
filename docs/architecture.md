@@ -105,6 +105,28 @@ yamux requires a `net.Conn`. gorilla WebSocket is not one — it frames messages
 - **Write**: wraps each write as a single binary WebSocket message, protected by a mutex
 - **ping**: uses `WriteControl` through the same mutex to avoid concurrent write panics
 
+## Metrics
+
+The gateway exposes Prometheus metrics at `GET /metrics` (same port as the WebSocket endpoint, default `:8080`).
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `ambush_exitnodes_active` | Gauge | — | Connected exit nodes |
+| `ambush_streams_active` | Gauge | — | Currently open proxy streams |
+| `ambush_dials_total` | Counter | `result` | Dial attempts — `success`, `error`, `rate_limited` |
+| `ambush_rotations_total` | Counter | `reason` | Affinity rotations — `budget`, `expiry`, `session_closed`, `concurrency` |
+| `ambush_stream_errors_total` | Counter | — | `yamux.Open()` failures (session died mid-routing) |
+| `ambush_credential_limit_exceeded_total` | Counter | — | Credentials that hit `MAX_STREAMS_PER_CREDENTIAL` |
+
+Minimal Prometheus scrape config:
+
+```yaml
+scrape_configs:
+  - job_name: ambush_gateway
+    static_configs:
+      - targets: ['gateway:8080']
+```
+
 ## Graceful shutdown sequence
 
 ```mermaid

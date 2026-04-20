@@ -65,8 +65,8 @@
 - [ ] Rate limit on failed token auth attempts (prevent brute force on `/exitnode`)
 
 ### Observability
+- [x] Prometheus metrics endpoint on gateway — `GET /metrics` (active exit nodes, streams, dials/s, rotation events, stream errors, credential limit hits)
 - [ ] Request IDs on exit node WebSocket connections
-- [ ] Prometheus metrics endpoint on gateway (active exit nodes, requests/s, stream errors, rotation events)
 
 ### Routing improvements
 - [ ] Exit node health scoring — track failure rates per exit node per domain, deprioritize flagged ones

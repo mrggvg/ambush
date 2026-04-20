@@ -50,7 +50,7 @@
 ### Security & correctness
 - [ ] Rate limiting per SOCKS5 credential
 - [ ] Per-user exit node diversity guarantee
-- [ ] TLS on the exit node ↔ gateway tunnel (self-signed cert, no domain required)
+- [x] TLS on the exit node ↔ gateway tunnel — self-signed CA, no domain required (see [docs/tls.md](tls.md))
 - [ ] Rate limit on failed token auth attempts (prevent brute force on `/exitnode`)
 
 ### Observability

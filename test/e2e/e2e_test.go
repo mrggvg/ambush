@@ -2,12 +2,20 @@ package e2e
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net"
 	"net/http"
 	"os"
@@ -96,16 +104,30 @@ func TestE2ETrafficFlowsThroughExitNode(t *testing.T) {
 	applySchema(t, ctx, pool)
 	seedTestData(t, ctx, pool)
 
+	// --- Generate TLS certs ---
+	caCertPEM, gwCertPEM, gwKeyPEM := genTestCerts(t)
+
+	certFile := filepath.Join(t.TempDir(), "gateway.crt")
+	keyFile := filepath.Join(t.TempDir(), "gateway.key")
+	if err := os.WriteFile(certFile, gwCertPEM, 0644); err != nil {
+		t.Fatalf("write cert: %v", err)
+	}
+	if err := os.WriteFile(keyFile, gwKeyPEM, 0600); err != nil {
+		t.Fatalf("write key: %v", err)
+	}
+
 	// --- Allocate ports ---
 	gwPort := freePort(t)
 	socksPort := freePort(t)
 
-	// --- Start gateway ---
+	// --- Start gateway with TLS ---
 	gwCmd := exec.Command(gatewayBin)
 	gwCmd.Env = append(os.Environ(),
 		"DATABASE_URL="+dbURL,
 		fmt.Sprintf("GATEWAY_ADDR=:%d", gwPort),
 		fmt.Sprintf("SOCKS5_ADDR=:%d", socksPort),
+		"TLS_CERT="+certFile,
+		"TLS_KEY="+keyFile,
 	)
 	gwCmd.Stdout = os.Stderr
 	gwCmd.Stderr = os.Stderr
@@ -114,11 +136,12 @@ func TestE2ETrafficFlowsThroughExitNode(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = gwCmd.Process.Kill() })
 
-	// --- Start exitnode ---
+	// --- Start exitnode over wss:// ---
 	enCmd := exec.Command(exitnodeBin)
 	enCmd.Env = append(os.Environ(),
-		fmt.Sprintf("AMBUSH_GATEWAY_URL=ws://127.0.0.1:%d", gwPort),
+		fmt.Sprintf("AMBUSH_GATEWAY_URL=wss://127.0.0.1:%d", gwPort),
 		"AMBUSH_TOKEN="+testToken,
+		"AMBUSH_CA_CERT="+string(caCertPEM),
 	)
 	enCmd.Stdout = os.Stderr
 	enCmd.Stderr = os.Stderr
@@ -128,11 +151,12 @@ func TestE2ETrafficFlowsThroughExitNode(t *testing.T) {
 	t.Cleanup(func() { _ = enCmd.Process.Kill() })
 
 	// --- Wait until exit node is in the pool ---
-	healthURL := fmt.Sprintf("http://127.0.0.1:%d/health", gwPort)
+	// Health endpoint is now HTTPS; use an insecure client just for polling.
+	healthURL := fmt.Sprintf("https://127.0.0.1:%d/health", gwPort)
 	waitForExitNode(t, healthURL, 30*time.Second)
 
 	// --- Local echo target server ---
-	// The exit node will dial this directly — no external internet needed.
+	// The exit node dials this directly — no external internet dependency.
 	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("echo listener: %v", err)
@@ -175,10 +199,63 @@ func TestE2ETrafficFlowsThroughExitNode(t *testing.T) {
 	if string(body) != "ambush-e2e-ok" {
 		t.Fatalf("unexpected response body: %q", string(body))
 	}
-	t.Log("traffic flowed through gateway → exit node → echo server")
+	t.Log("traffic flowed through gateway (TLS) → exit node → echo server")
 }
 
 // --- Helpers ---
+
+// genTestCerts generates an in-memory CA and gateway cert for testing.
+// Returns (caCertPEM, gatewayCertPEM, gatewayKeyPEM).
+func genTestCerts(t *testing.T) ([]byte, []byte, []byte) {
+	t.Helper()
+
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("gen CA key: %v", err)
+	}
+	caTmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "Ambush Test CA"},
+		NotBefore:             time.Now().Add(-time.Minute),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("create CA cert: %v", err)
+	}
+	caCert, _ := x509.ParseCertificate(caDER)
+
+	gwKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("gen gateway key: %v", err)
+	}
+	gwTmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: "ambush-gateway"},
+		DNSNames:     []string{"ambush-gateway"},
+		NotBefore:    time.Now().Add(-time.Minute),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	gwDER, err := x509.CreateCertificate(rand.Reader, gwTmpl, caCert, &gwKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("create gateway cert: %v", err)
+	}
+
+	gwKeyDER, err := x509.MarshalECPrivateKey(gwKey)
+	if err != nil {
+		t.Fatalf("marshal gateway key: %v", err)
+	}
+
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})
+	gwCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: gwDER})
+	gwKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: gwKeyDER})
+	return caPEM, gwCertPEM, gwKeyPEM
+}
 
 func applySchema(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
 	t.Helper()
@@ -195,18 +272,16 @@ func seedTestData(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
 	t.Helper()
 
 	var userID string
-	err := pool.QueryRow(ctx,
+	if err := pool.QueryRow(ctx,
 		`INSERT INTO users (display_name) VALUES ('e2e-test-user') RETURNING id`,
-	).Scan(&userID)
-	if err != nil {
+	).Scan(&userID); err != nil {
 		t.Fatalf("insert user: %v", err)
 	}
 
 	h := sha256.Sum256([]byte(testToken))
-	tokenHash := hex.EncodeToString(h[:])
 	if _, err := pool.Exec(ctx,
 		`INSERT INTO exit_node_tokens (user_id, token_hash, label) VALUES ($1, $2, 'e2e-node')`,
-		userID, tokenHash,
+		userID, hex.EncodeToString(h[:]),
 	); err != nil {
 		t.Fatalf("insert exit node token: %v", err)
 	}
@@ -219,11 +294,19 @@ func seedTestData(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
 	}
 }
 
+// waitForExitNode polls the health endpoint (HTTPS, insecure client) until
+// at least one exit node is registered in the pool.
 func waitForExitNode(t *testing.T, healthURL string, timeout time.Duration) {
 	t.Helper()
+	insecure := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+		},
+		Timeout: 3 * time.Second,
+	}
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		resp, err := http.Get(healthURL) //nolint:noctx
+		resp, err := insecure.Get(healthURL)
 		if err == nil {
 			var h struct {
 				ExitNodes int `json:"exitnodes"`

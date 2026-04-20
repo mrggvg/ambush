@@ -209,10 +209,20 @@ func main() {
 	httpServer := &http.Server{Addr: gatewayAddr}
 
 	go func() {
-		log.Printf("gateway listening on %s", gatewayAddr)
-		log.Printf("health endpoint: http://%s/health", gatewayAddr)
-		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("gateway stopped: %v", err)
+		certFile := os.Getenv("TLS_CERT")
+		keyFile := os.Getenv("TLS_KEY")
+		if certFile != "" && keyFile != "" {
+			log.Printf("gateway listening on %s (TLS)", gatewayAddr)
+			log.Printf("health endpoint: https://%s/health", gatewayAddr)
+			if err := httpServer.ListenAndServeTLS(certFile, keyFile); err != nil && err != http.ErrServerClosed {
+				log.Fatalf("gateway stopped: %v", err)
+			}
+		} else {
+			log.Printf("gateway listening on %s", gatewayAddr)
+			log.Printf("health endpoint: http://%s/health", gatewayAddr)
+			if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Fatalf("gateway stopped: %v", err)
+			}
 		}
 	}()
 
